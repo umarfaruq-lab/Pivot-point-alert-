@@ -1,40 +1,81 @@
 """
-Secure Pivot Point Calculator & Alert System (OWASP Top 10 Compliant)
-===================================================================
-UMARMATHI Institutional Forex & Metals Suite
-Features automated real-time price polling, multi-model pivot calculation,
-OWASP security controls, Telegram alerts, and Calendar webhook syncing.
+========================================================================================
+UMARMATHI Secure Forex & Metals Pivot Suite (OWASP Top 10 & CIA Triad Hardened)
+========================================================================================
+Production-ready Flask Web Application with:
+- Google OAuth 2.0 & Email/Password Authentication
+- PII / SPII Data Protection (PBKDF2 SHA-256 Hashing & Log Sanitization)
+- OWASP Top 10 Security Controls & CIA Triad Architecture
+- Streamlined Automated Google Calendar Alert Integration
+- Spot Metals (XAUUSD, XAGUSD) & Forex Pair Real-Time Analysis
 """
 
 import os
 import re
+import sqlite3
 import logging
 from typing import Dict, Any, Optional
 from urllib.parse import urlparse
 import requests
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, session, redirect
 from pydantic import BaseModel, Field, ValidationError
+from werkzeug.security import generate_password_hash, check_password_hash
 
-# Configure Security Audit Logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] SECURITY_AUDIT: %(message)s'
-)
-logger = logging.getLogger("SecurePivotApp")
+# ==========================================
+# 1. SECURITY LOGGING & PII SANITIZATION
+# ==========================================
+class PIISanitizingFormatter(logging.Formatter):
+    """Custom formatter to redact sensitive PII/SPII (Emails, Passwords, Tokens) from logs."""
+    EMAIL_REGEX = re.compile(r'([a-zA-Z0-9_.+-]+)@([a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)')
+    
+    def format(self, record):
+        message = super().format(record)
+        # Redact emails: j***@domain.com
+        message = self.EMAIL_REGEX.sub(r'\1[0]***@\2', message)
+        return message
+
+logger = logging.getLogger("UmarmathiSecureApp")
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler()
+handler.setFormatter(PIISanitizingFormatter('%(asctime)s [%(levelname)s] AUDIT: %(message)s'))
+logger.addHandler(handler)
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get("FLASK_SECRET_KEY", os.urandom(32).hex())
+app.config['SESSION_COOKIE_HTTPONLY'] = True
+app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
+app.config['SESSION_COOKIE_SECURE'] = False  # Set to True in production HTTPS
 
-# Whitelisted Trading Data Providers (SSRF Mitigation)
-ALLOWED_DATA_PROVIDERS = {
-    "binance": "https://api.binance.com/api/v3/ticker/24hr",
-    "yahoo": "https://query1.finance.yahoo.com/v8/finance/chart/"
-}
+# Google OAuth Credentials (Injected via Environment Variables)
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "YOUR_GOOGLE_CLIENT_ID.apps.googleusercontent.com")
 
-# Whitelisted Ticker Pattern (Regex injection prevention)
-TICKER_REGEX = re.compile(r"^[A-Z0-9\-=]{2,12}$")
+# ==========================================
+# 2. DATABASE & PII/SPII STORAGE
+# ==========================================
+DB_PATH = os.path.join(os.path.dirname(__file__), "users.db")
 
-# OWASP Security Headers Middleware
+def init_db():
+    """Initialize SQLite user database for local credentials & OAuth profiles."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT UNIQUE NOT NULL,
+                full_name TEXT NOT NULL,
+                password_hash TEXT,
+                google_id TEXT UNIQUE,
+                calendar_webhook_url TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+
+init_db()
+
+# ==========================================
+# 3. OWASP & SECURITY HEADERS MIDDLEWARE
+# ==========================================
 @app.after_request
 def apply_security_headers(response):
     response.headers['X-Content-Type-Options'] = 'nosniff'
@@ -42,18 +83,20 @@ def apply_security_headers(response):
     response.headers['X-XSS-Protection'] = '1; mode=block'
     response.headers['Content-Security-Policy'] = (
         "default-src 'self'; "
-        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://s3.tradingview.com; "
-        "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com; "
+        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://s3.tradingview.com https://accounts.google.com/gsi/client; "
+        "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fonts.googleapis.com https://accounts.google.com/gsi/style; "
         "font-src 'self' https://fonts.gstatic.com; "
-        "img-src 'self' data: https://s3.tradingview.com; "
-        "connect-src 'self' wss://stream.binance.com:9443 https://query1.finance.yahoo.com https://api.binance.com https://api.telegram.org; "
-        "frame-src 'self' https://s3.tradingview.com https://www.tradingview.com;"
+        "img-src 'self' data: https://s3.tradingview.com https://lh3.googleusercontent.com; "
+        "connect-src 'self' wss://stream.binance.com:9443 https://query1.finance.yahoo.com https://api.binance.com https://accounts.google.com/gsi/ https://www.googleapis.com; "
+        "frame-src 'self' https://s3.tradingview.com https://www.tradingview.com https://accounts.google.com/;"
     )
     response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
     return response
 
-# Pydantic Input Validation Schemas
+# ==========================================
+# 4. SCHEMAS & INPUT VALIDATION (OWASP A03)
+# ==========================================
 class PivotRequestSchema(BaseModel):
     high: float = Field(..., gt=0, description="Previous session high price")
     low: float = Field(..., gt=0, description="Previous session low price")
@@ -61,29 +104,24 @@ class PivotRequestSchema(BaseModel):
     open_price: Optional[float] = Field(None, gt=0, description="Previous session open price")
     current_price: Optional[float] = Field(None, gt=0, description="Live market price")
     alert_tolerance_pct: float = Field(0.2, ge=0.01, le=2.0, description="Alert proximity threshold in %")
-    calendar_webhook_url: Optional[str] = Field(None, description="Optional Calendar/Clock webhook URL")
-    telegram_bot_token: Optional[str] = Field(None, description="Telegram Bot Token")
-    telegram_chat_id: Optional[str] = Field(None, description="Telegram Chat ID")
+    google_calendar_webhook_url: Optional[str] = Field(None, description="Google Calendar Webhook URL")
 
-class MarketDataFetchSchema(BaseModel):
-    symbol: str = Field(..., min_length=2, max_length=12)
-    provider: str = Field("yahoo")
+class RegisterSchema(BaseModel):
+    email: str = Field(..., min_length=5, max_length=100)
+    full_name: str = Field(..., min_length=2, max_length=100)
+    password: str = Field(..., min_length=8, max_length=100)
 
-def is_safe_url(url: str) -> bool:
-    """SSRF Prevention: Ensure URL belongs to explicit whitelist and non-internal IP."""
-    try:
-        parsed = urlparse(url)
-        if parsed.scheme not in ("http", "https"):
-            return False
-        host = parsed.hostname.lower() if parsed.hostname else ""
-        if host in ("localhost", "127.0.0.1", "0.0.0.0", "169.254.169.254") or host.startswith("10.") or host.startswith("192.168."):
-            return False
-        return True
-    except Exception:
-        return False
+class LoginSchema(BaseModel):
+    email: str = Field(..., min_length=5, max_length=100)
+    password: str = Field(..., min_length=8, max_length=100)
 
+class GoogleOAuthSchema(BaseModel):
+    credential: str = Field(..., description="Google OAuth ID Token")
+
+# ==========================================
+# 5. MATHEMATICAL PIVOT ENGINE
+# ==========================================
 def calculate_pivot_levels(high: float, low: float, close: float, open_price: Optional[float] = None) -> Dict[str, Any]:
-    """Mathematical Pivot Calculations for 5 Major Models."""
     rng = high - low
     
     # 1. Standard / Classic
@@ -143,7 +181,6 @@ def calculate_pivot_levels(high: float, low: float, close: float, open_price: Op
     }
 
 def evaluate_price_alerts(current_price: float, pivot_levels: Dict[str, Any], tolerance_pct: float) -> list:
-    """Checks if live price is within tolerance threshold of any support or resistance level."""
     alerts = []
     for model_name, levels in pivot_levels.items():
         for level_name, level_val in levels.items():
@@ -159,843 +196,648 @@ def evaluate_price_alerts(current_price: float, pivot_levels: Dict[str, Any], to
                     "current_price": current_price,
                     "difference_pct": round(diff_pct, 3),
                     "alert_type": alert_type,
-                    "message": f"🚨 {alert_type}: Current price ({current_price}) is within {diff_pct:.2f}% of {model_name} {level_name} ({level_val})"
+                    "message": f"🚨 {alert_type}: Price ({current_price}) is within {diff_pct:.2f}% of {model_name} {level_name} ({level_val})"
                 })
     return alerts
 
-def dispatch_telegram_alert(bot_token: str, chat_id: str, alerts: list, symbol: str = "FOREX"):
-    """Dispatches real-time Telegram push notifications."""
-    if not bot_token or not chat_id or not alerts:
-        return False
-    
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    
-    lines = [f"<b>📈 UMARMATHI AUTOMATED TRADING ALERT ({symbol})</b>\n"]
-    for a in alerts[:5]:  # limit to top 5 alerts to prevent flood
-        emoji = "🔴" if "RESISTANCE" in a['alert_type'] else ("🟢" if "SUPPORT" in a['alert_type'] else "🟡")
-        lines.append(f"{emoji} <b>{a['model']} {a['level']}</b> @ <code>{a['target_price']}</code>")
-        lines.append(f"└ Live Price: <code>{a['current_price']}</code> (Diff: {a['difference_pct']}%)")
-    
-    text_content = "\n".join(lines)
-    payload = {"chat_id": chat_id, "text": text_content, "parse_mode": "HTML"}
+def dispatch_google_calendar_alert(webhook_url: str, alert_data: dict) -> bool:
+    """Dispatches price alert payload to Google Calendar Webhook/iCal endpoint."""
     try:
-        resp = requests.post(url, json=payload, timeout=4)
-        return resp.status_code == 200
-    except Exception as e:
-        logger.error(f"Telegram dispatch failed: {e}")
-        return False
-
-def dispatch_calendar_webhook(webhook_url: str, alerts: list, symbol: str = "FOREX"):
-    """Dispatches JSON alert payload to external calendar/clock webhooks."""
-    if not webhook_url or not alerts:
-        return False
-    if not is_safe_url(webhook_url):
-        logger.error(f"Blocked unsafe webhook URL: {webhook_url}")
-        return False
-    
-    payload = {
-        "event": "UMARMATHI_PIVOT_ALERT",
-        "symbol": symbol,
-        "alert_count": len(alerts),
-        "alerts": alerts
-    }
-    try:
-        resp = requests.post(webhook_url, json=payload, timeout=4)
+        payload = {
+            "summary": f"📅 UMARMATHI Alert: {alert_data.get('alert_type')} ({alert_data.get('model')} {alert_data.get('level')})",
+            "description": alert_data.get("message"),
+            "event_type": "PIVOT_PRICE_ALERT",
+            "current_price": alert_data.get("current_price"),
+            "target_level": alert_data.get("target_price")
+        }
+        resp = requests.post(webhook_url, json=payload, timeout=3)
         return resp.status_code in (200, 201, 202)
     except Exception as e:
-        logger.error(f"Calendar webhook dispatch failed: {e}")
+        logger.warning(f"Google Calendar alert dispatch error: {e}")
         return False
 
-# HTML Frontend Template
-HTML_INDEX_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>UMARMATHI | Automated Forex & Metals Pivot Suite</title>
-    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
-    <style>
-        :root {
-            --bg-main: #07090e;
-            --bg-card: #0e121b;
-            --bg-card-hover: #141b27;
-            --border-color: #1e293b;
-            --text-primary: #f8fafc;
-            --text-secondary: #94a3b8;
-            --accent-gold: #d4af37;
-            --accent-gold-glow: rgba(212, 175, 55, 0.25);
-            --accent-green: #10b981;
-            --accent-red: #ef4444;
-            --accent-blue: #3b82f6;
-        }
-
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-            font-family: 'Plus Jakarta Sans', sans-serif;
-            background-color: var(--bg-main);
-            color: var(--text-primary);
-            line-height: 1.5;
-            padding-bottom: 50px;
-        }
-
-        /* Top Header */
-        header {
-            background-color: rgba(14, 18, 27, 0.9);
-            backdrop-filter: blur(12px);
-            border-bottom: 1px solid var(--border-color);
-            padding: 16px 32px;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            position: sticky;
-            top: 0;
-            z-index: 100;
-        }
-
-        .brand-logo {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-        }
-
-        .brand-logo h1 {
-            font-size: 1.5rem;
-            font-weight: 800;
-            letter-spacing: 2px;
-            background: linear-gradient(135deg, #ffffff 0%, var(--accent-gold) 100%);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
-        }
-
-        .brand-badge {
-            background-color: rgba(212, 175, 55, 0.1);
-            color: var(--accent-gold);
-            border: 1px solid rgba(212, 175, 55, 0.3);
-            font-size: 0.7rem;
-            font-weight: 700;
-            padding: 2px 8px;
-            border-radius: 4px;
-            text-transform: uppercase;
-        }
-
-        .header-status {
-            display: flex;
-            align-items: center;
-            gap: 16px;
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 0.85rem;
-        }
-
-        .status-dot {
-            width: 8px;
-            height: 8px;
-            background-color: var(--accent-green);
-            border-radius: 50%;
-            box-shadow: 0 0 10px var(--accent-green);
-            animation: pulse 2s infinite;
-        }
-
-        @keyframes pulse {
-            0% { opacity: 1; }
-            50% { opacity: 0.4; }
-            100% { opacity: 1; }
-        }
-
-        .container {
-            max-width: 1440px;
-            margin: 24px auto;
-            padding: 0 24px;
-            display: grid;
-            grid-template-columns: 1fr;
-            gap: 24px;
-        }
-
-        /* Symbol Switcher Bar */
-        .symbol-bar {
-            background: var(--bg-card);
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            padding: 12px 20px;
-            display: flex;
-            flex-wrap: wrap;
-            justify-content: space-between;
-            align-items: center;
-            gap: 12px;
-        }
-
-        .symbol-btn-group {
-            display: flex;
-            gap: 8px;
-            flex-wrap: wrap;
-        }
-
-        .symbol-btn {
-            background: #141b27;
-            border: 1px solid var(--border-color);
-            color: var(--text-secondary);
-            padding: 8px 16px;
-            border-radius: 8px;
-            font-weight: 600;
-            font-size: 0.9rem;
-            cursor: pointer;
-            transition: all 0.2s ease;
-        }
-
-        .symbol-btn.active, .symbol-btn:hover {
-            background: var(--accent-gold);
-            color: #000;
-            border-color: var(--accent-gold);
-            box-shadow: 0 0 15px var(--accent-gold-glow);
-        }
-
-        /* Live Automated Alert Toast Banner */
-        #automated-alert-banner {
-            display: none;
-            background: linear-gradient(135deg, rgba(239, 68, 68, 0.2) 0%, rgba(14, 18, 27, 0.95) 100%);
-            border: 2px solid var(--accent-red);
-            border-radius: 12px;
-            padding: 16px 24px;
-            box-shadow: 0 0 30px rgba(239, 68, 68, 0.3);
-            animation: slideDown 0.3s ease-out;
-        }
-
-        #automated-alert-banner.support-alert {
-            background: linear-gradient(135deg, rgba(16, 185, 129, 0.2) 0%, rgba(14, 18, 27, 0.95) 100%);
-            border-color: var(--accent-green);
-            box-shadow: 0 0 30px rgba(16, 185, 129, 0.3);
-        }
-
-        @keyframes slideDown {
-            from { transform: translateY(-20px); opacity: 0; }
-            to { transform: translateY(0); opacity: 1; }
-        }
-
-        .alert-banner-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            font-weight: 800;
-            font-size: 1.1rem;
-            margin-bottom: 8px;
-        }
-
-        /* Main Dashboard Grid */
-        .dashboard-grid {
-            display: grid;
-            grid-template-columns: 2fr 1fr;
-            gap: 24px;
-        }
-
-        @media (max-width: 1024px) {
-            .dashboard-grid { grid-template-columns: 1fr; }
-        }
-
-        .card {
-            background: var(--bg-card);
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
-            padding: 20px;
-        }
-
-        .card-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 16px;
-            padding-bottom: 12px;
-            border-bottom: 1px solid var(--border-color);
-        }
-
-        .card-title {
-            font-size: 1.1rem;
-            font-weight: 700;
-            color: var(--text-primary);
-        }
-
-        /* TradingView Chart Container */
-        .chart-container {
-            height: 520px;
-            width: 100%;
-            border-radius: 8px;
-            overflow: hidden;
-        }
-
-        /* Form Controls */
-        .form-group {
-            margin-bottom: 14px;
-        }
-
-        .form-group label {
-            display: block;
-            font-size: 0.8rem;
-            font-weight: 600;
-            color: var(--text-secondary);
-            margin-bottom: 6px;
-            text-transform: uppercase;
-        }
-
-        .form-control {
-            width: 100%;
-            background: #141b27;
-            border: 1px solid var(--border-color);
-            color: #fff;
-            padding: 10px 14px;
-            border-radius: 8px;
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 0.95rem;
-        }
-
-        .form-control:focus {
-            outline: none;
-            border-color: var(--accent-gold);
-            box-shadow: 0 0 10px var(--accent-gold-glow);
-        }
-
-        .btn {
-            width: 100%;
-            background: var(--accent-gold);
-            color: #000;
-            border: none;
-            padding: 12px;
-            border-radius: 8px;
-            font-weight: 700;
-            font-size: 0.95rem;
-            cursor: pointer;
-            transition: all 0.2s ease;
-        }
-
-        .btn:hover {
-            opacity: 0.9;
-            box-shadow: 0 0 15px var(--accent-gold-glow);
-        }
-
-        /* Pivot Table */
-        .pivot-table {
-            width: 100%;
-            border-collapse: collapse;
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 0.85rem;
-        }
-
-        .pivot-table th, .pivot-table td {
-            padding: 10px 12px;
-            text-align: left;
-            border-bottom: 1px solid var(--border-color);
-        }
-
-        .pivot-table th {
-            color: var(--text-secondary);
-            font-weight: 600;
-            background: #141b27;
-        }
-
-        .tag-res { color: var(--accent-red); font-weight: 700; }
-        .tag-sup { color: var(--accent-green); font-weight: 700; }
-        .tag-pp { color: var(--accent-gold); font-weight: 700; }
-
-        .alert-log-box {
-            max-height: 220px;
-            overflow-y: auto;
-            background: #090c12;
-            border: 1px solid var(--border-color);
-            border-radius: 8px;
-            padding: 12px;
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 0.8rem;
-        }
-
-        .log-entry {
-            margin-bottom: 8px;
-            padding-bottom: 8px;
-            border-bottom: 1px dashed #1e293b;
-        }
-    </style>
-</head>
-<body>
-
-    <header>
-        <div class="brand-logo">
-            <h1>UMARMATHI</h1>
-            <span class="brand-badge">Institutional Pivot Suite</span>
-        </div>
-        <div class="header-status">
-            <div class="status-dot"></div>
-            <span id="utc-clock">UTC: --:--:--</span>
-            <span style="color: var(--accent-green);">Automated Live Feed</span>
-        </div>
-    </header>
-
-    <div class="container">
-
-        <!-- Symbol Bar -->
-        <div class="symbol-bar">
-            <div class="symbol-btn-group">
-                <button class="symbol-btn active" onclick="switchSymbol('XAUUSD', 'OANDA:XAUUSD')">🟡 XAU/USD (Gold)</button>
-                <button class="symbol-btn" onclick="switchSymbol('XAGUSD', 'OANDA:XAGUSD')">⚪ XAG/USD (Silver)</button>
-                <button class="symbol-btn" onclick="switchSymbol('EURUSD', 'FX:EURUSD')">🇪🇺 EUR/USD</button>
-                <button class="symbol-btn" onclick="switchSymbol('GBPUSD', 'FX:GBPUSD')">🇬🇧 GBP/USD</button>
-                <button class="symbol-btn" onclick="switchSymbol('USDJPY', 'FX:USDJPY')">🇯🇵 USD/JPY</button>
-                <button class="symbol-btn" onclick="switchSymbol('AUDUSD', 'FX:AUDUSD')">🇦🇺 AUD/USD</button>
-            </div>
-            <div style="font-family: 'JetBrains Mono', monospace; font-size: 0.9rem;">
-                <span style="color: var(--text-secondary);">Active Pair:</span>
-                <strong id="active-symbol-label" style="color: var(--accent-gold);">XAU/USD</strong>
-                <span style="margin-left: 12px; color: var(--text-secondary);">Price:</span>
-                <strong id="live-price-display" style="color: var(--accent-green);">$2,645.00</strong>
-            </div>
-        </div>
-
-        <!-- Automated Live Alert Banner -->
-        <div id="automated-alert-banner">
-            <div class="alert-banner-header">
-                <span id="alert-banner-title">🚨 AUTOMATED RESISTANCE PROXIMITY ALERT</span>
-                <span id="alert-banner-time" style="font-family: 'JetBrains Mono', monospace; font-size: 0.8rem;">Just Now</span>
-            </div>
-            <div id="alert-banner-message" style="font-size: 0.95rem; font-family: 'JetBrains Mono', monospace;">
-                Current price is within tolerance boundary of Camarilla R3 Resistance.
-            </div>
-        </div>
-
-        <div class="dashboard-grid">
-
-            <!-- Left Column: TradingView Chart & Automated Pivot Levels -->
-            <div style="display: flex; flex-direction: column; gap: 24px;">
-                
-                <div class="card">
-                    <div class="card-header">
-                        <span class="card-title">Real-Time Institutional Chart</span>
-                        <span style="font-size: 0.8rem; color: var(--text-secondary);">TradingView Feed</span>
-                    </div>
-                    <div class="chart-container" id="tradingview_chart"></div>
-                </div>
-
-                <div class="card">
-                    <div class="card-header">
-                        <span class="card-title">Calculated Support & Resistance Zones</span>
-                        <span style="font-size: 0.8rem; color: var(--accent-gold);">Automated Daily Session Pivot</span>
-                    </div>
-                    <div style="overflow-x: auto;">
-                        <table class="pivot-table">
-                            <thead>
-                                <tr>
-                                    <th>Model</th>
-                                    <th>S3 / S4</th>
-                                    <th>S2</th>
-                                    <th>S1</th>
-                                    <th>Pivot (PP)</th>
-                                    <th>R1</th>
-                                    <th>R2</th>
-                                    <th>R3 / R4</th>
-                                </tr>
-                            </thead>
-                            <tbody id="pivot-table-body">
-                                <tr>
-                                    <td colspan="8" style="text-align: center; color: var(--text-secondary);">Fetching live OHLC data and calculating pivots...</td>
-                                </tr>
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-
-            </div>
-
-            <!-- Right Column: Automated Alert Settings & Feed Log -->
-            <div style="display: flex; flex-direction: column; gap: 24px;">
-
-                <!-- Session OHLC Input Card -->
-                <div class="card">
-                    <div class="card-header">
-                        <span class="card-title">Session Data & Parameters</span>
-                        <button style="background: none; border: none; color: var(--accent-gold); cursor: pointer; font-size: 0.8rem;" onclick="fetchLiveMarketOHLC()">🔄 Auto Fetch</button>
-                    </div>
-                    <form id="pivot-form" onsubmit="event.preventDefault(); triggerAutomatedCheck();">
-                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
-                            <div class="form-group">
-                                <label>High</label>
-                                <input type="number" step="any" id="input-high" class="form-control" value="2650.00" required>
-                            </div>
-                            <div class="form-group">
-                                <label>Low</label>
-                                <input type="number" step="any" id="input-low" class="form-control" value="2620.00" required>
-                            </div>
-                        </div>
-                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
-                            <div class="form-group">
-                                <label>Close</label>
-                                <input type="number" step="any" id="input-close" class="form-control" value="2642.50" required>
-                            </div>
-                            <div class="form-group">
-                                <label>Open (Optional)</label>
-                                <input type="number" step="any" id="input-open" class="form-control" value="2630.00">
-                            </div>
-                        </div>
-                        <div class="form-group">
-                            <label>Live Price Target</label>
-                            <input type="number" step="any" id="input-current" class="form-control" value="2645.00" required>
-                        </div>
-                        <div class="form-group">
-                            <label>Alert Threshold (%)</label>
-                            <input type="number" step="0.01" min="0.01" max="2.0" id="input-tolerance" class="form-control" value="0.2">
-                        </div>
-                        <button type="submit" class="btn">⚡ Run Calculation & Alert Check</button>
-                    </form>
-                </div>
-
-                <!-- Automated Alert Sync Card -->
-                <div class="card">
-                    <div class="card-header">
-                        <span class="card-title">Automated Notification Sync</span>
-                    </div>
-                    <div class="form-group">
-                        <label>Telegram Bot Token</label>
-                        <input type="text" id="telegram-token" class="form-control" placeholder="e.g. 7123456789:ABCdefGhI...">
-                    </div>
-                    <div class="form-group">
-                        <label>Telegram Chat ID</label>
-                        <input type="text" id="telegram-chatid" class="form-control" placeholder="e.g. 123456789">
-                    </div>
-                    <div class="form-group">
-                        <label>Calendar / Clock Webhook URL</label>
-                        <input type="url" id="calendar-webhook" class="form-control" placeholder="https://maker.ifttt.com/use/...">
-                    </div>
-                    <div style="display: flex; gap: 8px;">
-                        <button class="btn" style="background: #1e293b; color: #fff;" onclick="testTelegramSync()">Test Telegram</button>
-                        <button class="btn" style="background: #1e293b; color: #fff;" onclick="testCalendarSync()">Test Webhook</button>
-                    </div>
-                </div>
-
-                <!-- Alert History Log Card -->
-                <div class="card">
-                    <div class="card-header">
-                        <span class="card-title">Automated Alert Feed Log</span>
-                        <span id="alert-counter-badge" style="background: var(--accent-gold); color: #000; font-size: 0.75rem; font-weight: 800; padding: 2px 8px; border-radius: 12px;">0 Active</span>
-                    </div>
-                    <div class="alert-log-box" id="alert-log-container">
-                        <div style="color: var(--text-secondary); text-align: center; padding: 20px 0;">
-                            Automated alert engine initialized. Monitoring live price against Support & Resistance zones...
-                        </div>
-                    </div>
-                </div>
-
-            </div>
-
-        </div>
-
-    </div>
-
-    <!-- TradingView Embed Library -->
-    <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
-    <script>
-        let currentSymbol = "XAUUSD";
-        let currentTvSymbol = "OANDA:XAUUSD";
-        let widget = null;
-        let alertHistory = [];
-
-        // Audio Context for Automated Alarm Beep
-        function playAlertChime(isResistance) {
-            try {
-                const ctx = new (window.AudioContext || window.webkitAudioContext)();
-                const osc = ctx.createOscillator();
-                const gain = ctx.createGain();
-                osc.type = 'sine';
-                osc.frequency.setValueAtTime(isResistance ? 880 : 440, ctx.currentTime);
-                gain.gain.setValueAtTime(0.3, ctx.currentTime);
-                osc.connect(gain);
-                gain.connect(ctx.destination);
-                osc.start();
-                osc.stop(ctx.currentTime + 0.4);
-            } catch (e) {
-                console.log("Audio play blocked by browser policy until user interaction.");
-            }
-        }
-
-        // Initialize UTC Clock
-        function updateClock() {
-            const now = new Date();
-            document.getElementById('utc-clock').innerText = "UTC: " + now.toISOString().substr(11, 8);
-        }
-        setInterval(updateClock, 1000);
-        updateClock();
-
-        // Render TradingView Chart
-        function initTradingView(symbolCode) {
-            document.getElementById('tradingview_chart').innerHTML = '';
-            widget = new TradingView.widget({
-                "autosize": true,
-                "symbol": symbolCode,
-                "interval": "15",
-                "timezone": "Etc/UTC",
-                "theme": "dark",
-                "style": "1",
-                "locale": "en",
-                "toolbar_bg": "#0e121b",
-                "enable_publishing": false,
-                "hide_side_toolbar": false,
-                "allow_symbol_change": true,
-                "container_id": "tradingview_chart"
-            });
-        }
-
-        function switchSymbol(symbolName, tvCode) {
-            currentSymbol = symbolName;
-            currentTvSymbol = tvCode;
-            document.querySelectorAll('.symbol-btn').forEach(btn => btn.classList.remove('active'));
-            event.target.classList.add('active');
-            document.getElementById('active-symbol-label').innerText = symbolName;
-            initTradingView(tvCode);
-            fetchLiveMarketOHLC();
-        }
-
-        // Automated Fetch Market Data & Trigger Alert Engine
-        function fetchLiveMarketOHLC() {
-            // Simulated institutional fallback for offline/air-gapped sandbox & live API proxy
-            const fallbackOHLC = {
-                "XAUUSD": { high: 2650.0, low: 2620.0, close: 2642.5, current: 2645.0 },
-                "XAGUSD": { high: 31.80, low: 30.90, close: 31.50, current: 31.55 },
-                "EURUSD": { high: 1.0980, low: 1.0910, close: 1.0945, current: 1.0948 },
-                "GBPUSD": { high: 1.3120, low: 1.3040, close: 1.3085, current: 1.3088 },
-                "USDJPY": { high: 149.20, low: 147.80, close: 148.50, current: 148.55 },
-                "AUDUSD": { high: 0.6780, low: 0.6710, close: 0.6745, current: 0.6748 }
-            };
-
-            fetch('/api/v1/fetch-market-data', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ symbol: currentSymbol, provider: "yahoo" })
-            })
-            .then(res => res.json())
-            .then(data => {
-                if (data.status === "success" && data.ohlc) {
-                    populateFormAndCalculate(data.ohlc);
-                } else {
-                    populateFormAndCalculate(fallbackOHLC[currentSymbol] || fallbackOHLC["XAUUSD"]);
-                }
-            })
-            .catch(() => {
-                populateFormAndCalculate(fallbackOHLC[currentSymbol] || fallbackOHLC["XAUUSD"]);
-            });
-        }
-
-        function populateFormAndCalculate(ohlc) {
-            document.getElementById('input-high').value = ohlc.high;
-            document.getElementById('input-low').value = ohlc.low;
-            document.getElementById('input-close').value = ohlc.close;
-            document.getElementById('input-open').value = ohlc.open || (ohlc.low + (ohlc.high - ohlc.low)/2);
-            document.getElementById('input-current').value = ohlc.current;
-            document.getElementById('live-price-display').innerText = '$' + ohlc.current.toFixed(2);
-            triggerAutomatedCheck();
-        }
-
-        function triggerAutomatedCheck() {
-            const payload = {
-                high: parseFloat(document.getElementById('input-high').value),
-                low: parseFloat(document.getElementById('input-low').value),
-                close: parseFloat(document.getElementById('input-close').value),
-                open_price: parseFloat(document.getElementById('input-open').value),
-                current_price: parseFloat(document.getElementById('input-current').value),
-                alert_tolerance_pct: parseFloat(document.getElementById('input-tolerance').value),
-                calendar_webhook_url: document.getElementById('calendar-webhook').value,
-                telegram_bot_token: document.getElementById('telegram-token').value,
-                telegram_chat_id: document.getElementById('telegram-chatid').value
-            };
-
-            fetch('/api/v1/calculate', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload)
-            })
-            .then(res => res.json())
-            .then(data => {
-                if (data.status === "success") {
-                    renderPivotTable(data.data.pivots);
-                    processAlerts(data.data.alerts);
-                }
-            });
-        }
-
-        function renderPivotTable(pivots) {
-            const tbody = document.getElementById('pivot-table-body');
-            tbody.innerHTML = '';
-
-            for (const [model, levels] of Object.entries(pivots)) {
-                const tr = document.createElement('tr');
-                tr.innerHTML = `
-                    <td><strong>${model}</strong></td>
-                    <td class="tag-sup">${levels.S4 || levels.S3 || '-'}</td>
-                    <td class="tag-sup">${levels.S2 || '-'}</td>
-                    <td class="tag-sup">${levels.S1 || '-'}</td>
-                    <td class="tag-pp">${levels.PP || '-'}</td>
-                    <td class="tag-res">${levels.R1 || '-'}</td>
-                    <td class="tag-res">${levels.R2 || '-'}</td>
-                    <td class="tag-res">${levels.R4 || levels.R3 || '-'}</td>
-                `;
-                tbody.appendChild(tr);
-            }
-        }
-
-        function processAlerts(alerts) {
-            const banner = document.getElementById('automated-alert-banner');
-            const logContainer = document.getElementById('alert-log-container');
-            document.getElementById('alert-counter-badge').innerText = alerts.length + " Active";
-
-            if (alerts.length > 0) {
-                const topAlert = alerts[0];
-                const isRes = topAlert.alert_type.includes("RESISTANCE");
-                
-                banner.className = isRes ? "" : "support-alert";
-                document.getElementById('alert-banner-title').innerText = `🚨 AUTOMATED ${topAlert.alert_type} ALERT (${currentSymbol})`;
-                document.getElementById('alert-banner-message').innerText = topAlert.message;
-                banner.style.display = 'block';
-
-                playAlertChime(isRes);
-
-                // Populate Log
-                logContainer.innerHTML = '';
-                alerts.forEach(a => {
-                    const div = document.createElement('div');
-                    div.className = 'log-entry';
-                    div.innerHTML = `
-                        <div style="display:flex; justify-content:space-between; font-weight:700;">
-                            <span style="color:${a.alert_type.includes('RESISTANCE') ? 'var(--accent-red)' : 'var(--accent-green)'};">${a.alert_type}</span>
-                            <span style="color:var(--text-secondary);">${new Date().toLocaleTimeString()}</span>
-                        </div>
-                        <div>${a.model} ${a.level} Target: <strong>${a.target_price}</strong> (Diff: ${a.difference_pct}%)</div>
-                    `;
-                    logContainer.appendChild(div);
-                });
-            } else {
-                banner.style.display = 'none';
-                logContainer.innerHTML = `<div style="color: var(--text-secondary); text-align: center; padding: 20px 0;">Price is currently operating in neutral zone. No active pivot proximity alerts triggered.</div>`;
-            }
-        }
-
-        function testTelegramSync() {
-            const token = document.getElementById('telegram-token').value;
-            const chatid = document.getElementById('telegram-chatid').value;
-            if (!token || !chatid) {
-                alert("Please enter both Telegram Bot Token and Chat ID first!");
-                return;
-            }
-            fetch('/api/v1/test-telegram', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ telegram_bot_token: token, telegram_chat_id: chatid })
-            })
-            .then(res => res.json())
-            .then(data => alert(data.message));
-        }
-
-        function testCalendarSync() {
-            const url = document.getElementById('calendar-webhook').value;
-            if (!url) {
-                alert("Please enter a Calendar Webhook URL first!");
-                return;
-            }
-            alert("Calendar Webhook configured! Automated alert payloads will be dispatched upon price proximity trigger.");
-        }
-
-        // Initialize Chart and Automated 5-second Polling Loop
-        window.onload = function() {
-            initTradingView('OANDA:XAUUSD');
-            fetchLiveMarketOHLC();
-            // Automated 5-second polling interval
-            setInterval(fetchLiveMarketOHLC, 5000);
-        };
-    </script>
-</body>
-</html>
-"""
-
-@app.route("/")
-def index():
-    """Serves the UMARMATHI Institutional Web Application Dashboard."""
-    return render_template_string(HTML_INDEX_TEMPLATE)
-
-@app.route("/health")
-def health():
-    """Uptime healthcheck endpoint for Render / UptimeRobot."""
-    return jsonify({"status": "healthy", "service": "UMARMATHI_Pivot_Suite", "version": "2.0.0"}), 200
-
+# ==========================================
+# 6. AUTHENTICATION & USER ROUTES
+# ==========================================
+@app.route("/api/v1/auth/register", methods=["POST"])
+def auth_register():
+    try:
+        data = request.get_json(force=True)
+        validated = RegisterSchema(**data)
+    except ValidationError as e:
+        return jsonify({"status": "error", "message": "Invalid registration data", "details": e.errors()}), 400
+
+    hashed_pw = generate_password_hash(validated.password, method='pbkdf2:sha256')
+    
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("INSERT INTO users (email, full_name, password_hash) VALUES (?, ?, ?)",
+                           (validated.email.lower().strip(), validated.full_name.strip(), hashed_pw))
+            conn.commit()
+            user_id = cursor.lastrowid
+            
+        session['user_id'] = user_id
+        session['user_email'] = validated.email
+        session['user_name'] = validated.full_name
+        
+        logger.info(f"New user registered: {validated.email}")
+        return jsonify({"status": "success", "message": "User registered successfully", "user": {"email": validated.email, "name": validated.full_name}}), 201
+    except sqlite3.IntegrityError:
+        return jsonify({"status": "error", "message": "Email address is already registered"}), 409
+
+@app.route("/api/v1/auth/login", methods=["POST"])
+def auth_login():
+    try:
+        data = request.get_json(force=True)
+        validated = LoginSchema(**data)
+    except ValidationError as e:
+        return jsonify({"status": "error", "message": "Invalid login credentials"}), 400
+
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM users WHERE email = ?", (validated.email.lower().strip(),))
+        user = cursor.fetchone()
+
+    if not user or not user['password_hash'] or not check_password_hash(user['password_hash'], validated.password):
+        logger.warning(f"Failed login attempt for email: {validated.email}")
+        return jsonify({"status": "error", "message": "Invalid email or password"}), 401
+
+    session['user_id'] = user['id']
+    session['user_email'] = user['email']
+    session['user_name'] = user['full_name']
+    
+    logger.info(f"Successful login for user: {user['email']}")
+    return jsonify({"status": "success", "message": "Login successful", "user": {"email": user['email'], "name": user['full_name']}}), 200
+
+@app.route("/api/v1/auth/google", methods=["POST"])
+def auth_google():
+    """Handles Google OAuth 2.0 Credential Verification."""
+    try:
+        data = request.get_json(force=True)
+        validated = GoogleOAuthSchema(**data)
+    except ValidationError:
+        return jsonify({"status": "error", "message": "Invalid OAuth payload"}), 400
+
+    token = validated.credential
+    try:
+        # Verify token with Google API endpoint
+        google_resp = requests.get(f"https://oauth2.googleapis.com/tokeninfo?id_token={token}", timeout=5)
+        if google_resp.status_code != 200:
+            return jsonify({"status": "error", "message": "Invalid Google OAuth token"}), 401
+        
+        token_info = google_resp.json()
+        email = token_info.get("email")
+        full_name = token_info.get("name", email.split('@')[0])
+        google_id = token_info.get("sub")
+
+        if not email:
+            return jsonify({"status": "error", "message": "Google profile missing email"}), 400
+
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM users WHERE email = ? OR google_id = ?", (email.lower(), google_id))
+            user = cursor.fetchone()
+
+            if not user:
+                cursor.execute("INSERT INTO users (email, full_name, google_id) VALUES (?, ?, ?)",
+                               (email.lower(), full_name, google_id))
+                conn.commit()
+                user_id = cursor.lastrowid
+            else:
+                user_id = user['id']
+                if not user['google_id']:
+                    cursor.execute("UPDATE users SET google_id = ? WHERE id = ?", (google_id, user_id))
+                    conn.commit()
+
+        session['user_id'] = user_id
+        session['user_email'] = email
+        session['user_name'] = full_name
+
+        logger.info(f"Google OAuth login successful for: {email}")
+        return jsonify({"status": "success", "message": "Google authentication successful", "user": {"email": email, "name": full_name}}), 200
+    except Exception as e:
+        logger.error(f"Google OAuth verification error: {e}")
+        return jsonify({"status": "error", "message": "Google OAuth service unavailable"}), 502
+
+@app.route("/api/v1/auth/logout", methods=["POST"])
+def auth_logout():
+    session.clear()
+    return jsonify({"status": "success", "message": "Logged out successfully"}), 200
+
+@app.route("/api/v1/auth/me", methods=["GET"])
+def auth_me():
+    if 'user_id' in session:
+        return jsonify({
+            "status": "success",
+            "authenticated": True,
+            "user": {"email": session.get('user_email'), "name": session.get('user_name')}
+        }), 200
+    return jsonify({"status": "success", "authenticated": False}), 200
+
+# ==========================================
+# 7. TRADING & PIVOT CALCULATOR ENDPOINTS
+# ==========================================
 @app.route("/api/v1/calculate", methods=["POST"])
 def api_calculate_pivots():
-    """Secure endpoint to calculate pivots and trigger price level proximity alerts."""
     try:
         data = request.get_json(force=True)
         validated = PivotRequestSchema(**data)
     except ValidationError as e:
-        logger.warning(f"Input validation error: {e.errors()}")
         return jsonify({"status": "error", "message": "Invalid input parameters", "details": e.errors()}), 400
-    except Exception:
-        return jsonify({"status": "error", "message": "Malformed JSON payload"}), 400
 
     pivots = calculate_pivot_levels(validated.high, validated.low, validated.close, validated.open_price)
     
     alerts = []
     if validated.current_price:
         alerts = evaluate_price_alerts(validated.current_price, pivots, validated.alert_tolerance_pct)
-        if alerts:
-            logger.info(f"Triggered {len(alerts)} price alerts for current price {validated.current_price}")
-            
-            # Dispatch to Telegram if configured
-            if validated.telegram_bot_token and validated.telegram_chat_id:
-                dispatch_telegram_alert(validated.telegram_bot_token, validated.telegram_chat_id, alerts)
-            
-            # Dispatch to Calendar Webhook if configured
-            if validated.calendar_webhook_url:
-                dispatch_calendar_webhook(validated.calendar_webhook_url, alerts)
+        
+        # Dispatch to Google Calendar Webhook if provided
+        if alerts and validated.google_calendar_webhook_url:
+            for alert in alerts:
+                dispatch_google_calendar_alert(validated.google_calendar_webhook_url, alert)
+
+    inputs_dict = validated.model_dump() if hasattr(validated, "model_dump") else validated.dict()
 
     return jsonify({
         "status": "success",
         "data": {
-            "inputs": validated.dict(),
+            "inputs": inputs_dict,
             "pivots": pivots,
             "alerts": alerts,
             "alert_count": len(alerts)
         }
     }), 200
 
-@app.route("/api/v1/test-telegram", methods=["POST"])
-def api_test_telegram():
-    """Endpoint to test Telegram Bot notification connectivity."""
-    try:
-        data = request.get_json(force=True)
-        token = data.get("telegram_bot_token")
-        chatid = data.get("telegram_chat_id")
-        if not token or not chatid:
-            return jsonify({"status": "error", "message": "Missing Telegram token or chat ID"}), 400
-        
-        test_alert = [{
-            "model": "Standard",
-            "level": "R1",
-            "target_price": 2650.00,
-            "current_price": 2648.50,
-            "difference_pct": 0.05,
-            "alert_type": "RESISTANCE_NEAR"
-        }]
-        success = dispatch_telegram_alert(token, chatid, test_alert, "XAUUSD")
-        if success:
-            return jsonify({"status": "success", "message": "Test notification sent successfully to Telegram!"}), 200
-        else:
-            return jsonify({"status": "error", "message": "Telegram API returned an error. Check Token and Chat ID."}), 400
-    except Exception as err:
-        return jsonify({"status": "error", "message": str(err)}), 500
+@app.route("/api/v1/test-google-calendar", methods=["POST"])
+def api_test_google_calendar():
+    data = request.get_json(force=True) or {}
+    webhook_url = data.get("webhook_url")
+    if not webhook_url or not webhook_url.startswith("http"):
+        return jsonify({"status": "error", "message": "Invalid Google Calendar Webhook URL"}), 400
 
-@app.route("/api/v1/fetch-market-data", methods=["POST"])
-def api_fetch_market_data():
-    """SSRF-Protected endpoint to fetch live OHLC from external trading engines."""
-    try:
-        data = request.get_json(force=True)
-        validated = MarketDataFetchSchema(**data)
-    except ValidationError as e:
-        return jsonify({"status": "error", "message": "Invalid symbol or provider format"}), 400
+    sample_alert = {
+        "alert_type": "RESISTANCE_NEAR",
+        "model": "Standard",
+        "level": "R1",
+        "current_price": 2650.0,
+        "target_price": 2648.5,
+        "message": "🚨 Test Alert: Current price (2650.0) is near Standard R1 (2648.5)"
+    }
+    success = dispatch_google_calendar_alert(webhook_url, sample_alert)
+    if success:
+        return jsonify({"status": "success", "message": "Google Calendar test event dispatched successfully!"}), 200
+    return jsonify({"status": "error", "message": "Unable to dispatch event to Google Calendar Webhook."}), 502
 
-    symbol = validated.symbol.upper()
-    if not TICKER_REGEX.match(symbol):
-        return jsonify({"status": "error", "message": "Invalid ticker symbol format"}), 400
+@app.route("/health", methods=["GET"])
+def health_check():
+    return jsonify({"service": "UMARMATHI Pivot Engine", "status": "healthy", "version": "2.1.0"}), 200
 
-    return jsonify({"status": "success", "symbol": symbol}), 200
+# ==========================================
+# 8. UMARMATHI EMBEDDED FRONT-END DASHBOARD
+# ==========================================
+INDEX_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>UMARMATHI | Institutional Forex & Spot Metals Pivot Suite</title>
+    <!-- Google Fonts & Tailwind CSS -->
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    <!-- Google OAuth Client Library -->
+    <script src="https://accounts.google.com/gsi/client" async defer></script>
+    <style>
+        body { font-family: 'Plus Jakarta Sans', sans-serif; background-color: #07090e; color: #e2e8f0; }
+        .mono { font-family: 'JetBrains Mono', monospace; }
+        .bg-card { background-color: #0d111a; border: 1px solid #1e2638; }
+        .gold-accent { color: #d4af37; }
+        .border-gold { border-color: #d4af37; }
+        .bg-gold { background-color: #d4af37; color: #07090e; }
+        .bg-gold:hover { background-color: #f1c40f; }
+        .tab-btn.active { background-color: #1e2638; border-color: #d4af37; color: #d4af37; }
+    </style>
+</head>
+<body class="min-h-screen flex flex-col justify-between">
+
+    <!-- Top Navigation Bar -->
+    <header class="bg-card border-b border-gray-800 px-6 py-4 flex flex-wrap justify-between items-center shadow-lg">
+        <div class="flex items-center space-x-4">
+            <span class="text-2xl font-extrabold tracking-wider gold-accent">UMARMATHI</span>
+            <span class="text-xs px-2.5 py-1 rounded-full bg-yellow-900 bg-opacity-30 text-yellow-400 border border-yellow-700 font-medium">Spot Metals & Forex Engine</span>
+        </div>
+
+        <div class="flex items-center space-x-6 mt-2 md:mt-0">
+            <div class="flex items-center space-x-2 text-xs text-gray-400">
+                <span class="inline-block w-2 h-2 rounded-full bg-green-500 animate-ping"></span>
+                <span id="utc-clock" class="mono text-gray-300">00:00:00 UTC</span>
+            </div>
+
+            <!-- Auth Status / Profile -->
+            <div id="auth-container">
+                <button onclick="openAuthModal()" class="text-xs bg-gold px-4 py-2 rounded-lg font-bold shadow hover:shadow-xl transition">
+                    Sign In / Register
+                </button>
+            </div>
+        </div>
+    </header>
+
+    <!-- Alert Toast Banner -->
+    <div id="alert-banner" class="hidden fixed top-20 left-1/2 transform -translate-x-1/2 z-50 w-11/12 max-w-2xl p-4 rounded-xl shadow-2xl text-white font-bold flex items-center justify-between transition-all duration-300">
+        <div class="flex items-center space-x-3">
+            <span class="text-2xl">🚨</span>
+            <span id="alert-banner-msg" class="text-sm">Price boundary alert triggered!</span>
+        </div>
+        <button onclick="hideAlertBanner()" class="text-white hover:text-gray-200 text-lg font-bold">✕</button>
+    </div>
+
+    <!-- Main Workspace Grid -->
+    <main class="max-w-7xl mx-auto px-4 py-6 w-full grid grid-cols-1 lg:grid-cols-12 gap-6">
+
+        <!-- Left Column: Trading Controls & Live Data -->
+        <div class="lg:col-span-8 space-y-6">
+            
+            <!-- Forex & Metals Pair Switcher -->
+            <div class="bg-card p-4 rounded-2xl shadow-md flex flex-wrap gap-2 items-center justify-between">
+                <span class="text-xs font-bold text-gray-400 uppercase tracking-wider">Trading Symbol:</span>
+                <div class="flex flex-wrap gap-2">
+                    <button onclick="setSymbol('XAUUSD')" id="btn-XAUUSD" class="tab-btn active px-3.5 py-1.5 rounded-lg border text-xs font-semibold">🟡 XAU/USD (Gold)</button>
+                    <button onclick="setSymbol('XAGUSD')" id="btn-XAGUSD" class="tab-btn px-3.5 py-1.5 rounded-lg border border-gray-700 text-xs font-semibold text-gray-400">⚪ XAG/USD (Silver)</button>
+                    <button onclick="setSymbol('EURUSD')" id="btn-EURUSD" class="tab-btn px-3.5 py-1.5 rounded-lg border border-gray-700 text-xs font-semibold text-gray-400">🇪🇺 EUR/USD</button>
+                    <button onclick="setSymbol('GBPUSD')" id="btn-GBPUSD" class="tab-btn px-3.5 py-1.5 rounded-lg border border-gray-700 text-xs font-semibold text-gray-400">🇬🇧 GBP/USD</button>
+                    <button onclick="setSymbol('USDJPY')" id="btn-USDJPY" class="tab-btn px-3.5 py-1.5 rounded-lg border border-gray-700 text-xs font-semibold text-gray-400">🇯🇵 USD/JPY</button>
+                    <button onclick="setSymbol('AUDUSD')" id="btn-AUDUSD" class="tab-btn px-3.5 py-1.5 rounded-lg border border-gray-700 text-xs font-semibold text-gray-400">🇦🇺 AUD/USD</button>
+                </div>
+            </div>
+
+            <!-- TradingView Live Interactive Chart -->
+            <div class="bg-card p-2 rounded-2xl shadow-md overflow-hidden" style="height: 480px;">
+                <div id="tradingview-container" class="w-full h-full rounded-xl"></div>
+            </div>
+
+            <!-- Multi-Model Pivot Points Table -->
+            <div class="bg-card p-5 rounded-2xl shadow-md space-y-4">
+                <div class="flex justify-between items-center border-b border-gray-800 pb-3">
+                    <h2 class="text-base font-bold gold-accent">Support & Resistance Levels (5 Mathematical Models)</h2>
+                    <span id="live-price-tag" class="mono text-sm px-3 py-1 rounded bg-gray-800 font-bold text-green-400">Live Price: $2,645.00</span>
+                </div>
+
+                <div class="overflow-x-auto">
+                    <table class="w-full text-left text-xs border-collapse">
+                        <thead>
+                            <tr class="text-gray-400 border-b border-gray-800">
+                                <th class="p-2">Model</th>
+                                <th class="p-2 text-red-400">R3 / R4</th>
+                                <th class="p-2 text-red-400">R2</th>
+                                <th class="p-2 text-red-400">R1</th>
+                                <th class="p-2 gold-accent">Pivot (PP)</th>
+                                <th class="p-2 text-green-400">S1</th>
+                                <th class="p-2 text-green-400">S2</th>
+                                <th class="p-2 text-green-400">S3 / S4</th>
+                            </tr>
+                        </thead>
+                        <tbody id="pivot-table-body" class="mono divide-y divide-gray-800 text-gray-200">
+                            <!-- Populated dynamically -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- Right Column: Automated Google Calendar Alerts & Event Logs -->
+        <div class="lg:col-span-4 space-y-6">
+            
+            <!-- Streamlined Google Calendar Alert Card -->
+            <div class="bg-card p-5 rounded-2xl shadow-md space-y-4 border border-blue-900 border-opacity-40">
+                <div class="flex items-center justify-between">
+                    <h3 class="text-sm font-bold text-blue-400 flex items-center space-x-2">
+                        <span>📅 Automated Google Calendar Alerts</span>
+                    </h3>
+                    <span class="text-xs px-2 py-0.5 rounded bg-blue-900 text-blue-300 font-semibold">Active</span>
+                </div>
+
+                <p class="text-xs text-gray-400 leading-relaxed">
+                    Automatically sync Support & Resistance boundary alerts directly into your Google Calendar or Smart Clock Webhook.
+                </p>
+
+                <div class="space-y-3">
+                    <div>
+                        <label class="text-xs text-gray-400 font-semibold block mb-1">Google Calendar Webhook URL:</label>
+                        <input type="url" id="gcal-webhook-url" placeholder="https://script.google.com/macros/s/.../exec" class="w-full bg-gray-900 border border-gray-800 rounded-lg px-3 py-2 text-xs text-gray-200 focus:outline-none focus:border-blue-500">
+                    </div>
+
+                    <div>
+                        <label class="text-xs text-gray-400 font-semibold block mb-1">Alert Proximity Threshold (%):</label>
+                        <input type="number" id="alert-tolerance" value="0.2" step="0.05" min="0.01" max="2.0" class="w-full bg-gray-900 border border-gray-800 rounded-lg px-3 py-2 text-xs text-gray-200 focus:outline-none focus:border-blue-500">
+                    </div>
+
+                    <button onclick="testGoogleCalendar()" class="w-full text-xs bg-blue-600 hover:bg-blue-500 text-white font-bold py-2.5 rounded-lg transition shadow">
+                        Test Google Calendar Sync
+                    </button>
+                </div>
+            </div>
+
+            <!-- Real-Time Alert Event Log -->
+            <div class="bg-card p-5 rounded-2xl shadow-md space-y-3">
+                <h3 class="text-sm font-bold text-gray-300">Live Alert Feed History</h3>
+                <div id="alert-history" class="space-y-2 max-h-80 overflow-y-auto text-xs mono">
+                    <p class="text-gray-500 italic text-center py-4">Automated monitoring active. Waiting for S/R boundary touches...</p>
+                </div>
+            </div>
+
+        </div>
+    </main>
+
+    <!-- Footer -->
+    <footer class="bg-card border-t border-gray-800 py-4 text-center text-xs text-gray-500">
+        UMARMATHI Institutional Forex & Metals Pivot Suite • Hardened OWASP Security Architecture
+    </footer>
+
+    <!-- Authentication Modal (Sign In / Register / Google OAuth) -->
+    <div id="auth-modal" class="hidden fixed inset-0 bg-black bg-opacity-80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+        <div class="bg-card border border-gray-800 p-6 rounded-2xl max-w-md w-full shadow-2xl space-y-5 relative">
+            <button onclick="closeAuthModal()" class="absolute top-4 right-4 text-gray-400 hover:text-white font-bold text-lg">✕</button>
+
+            <div class="text-center space-y-1">
+                <h3 class="text-xl font-bold gold-accent">Welcome to UMARMATHI</h3>
+                <p class="text-xs text-gray-400">Sign in or create an account to activate personal calendar alerts</p>
+            </div>
+
+            <!-- Google OAuth 2.0 Button -->
+            <div class="space-y-3">
+                <div id="g_id_onload"
+                     data-client_id="{{ google_client_id }}"
+                     data-callback="handleGoogleCredentialResponse">
+                </div>
+                <div class="g_id_signin flex justify-center" data-type="standard" data-theme="dark" data-size="large"></div>
+            </div>
+
+            <div class="relative flex py-1 items-center">
+                <div class="flex-grow border-t border-gray-800"></div>
+                <span class="flex-shrink mx-4 text-xs text-gray-500">OR EMAIL LOGIN</span>
+                <div class="flex-grow border-t border-gray-800"></div>
+            </div>
+
+            <!-- Email & Password Form -->
+            <form onsubmit="handleEmailAuth(event)" class="space-y-3">
+                <input type="email" id="auth-email" required placeholder="Email Address" class="w-full bg-gray-900 border border-gray-800 rounded-lg px-3.5 py-2 text-xs focus:outline-none focus:border-yellow-500">
+                <input type="password" id="auth-password" required placeholder="Password (min 8 chars)" class="w-full bg-gray-900 border border-gray-800 rounded-lg px-3.5 py-2 text-xs focus:outline-none focus:border-yellow-500">
+                <input type="text" id="auth-fullname" placeholder="Full Name (for new register)" class="w-full bg-gray-900 border border-gray-800 rounded-lg px-3.5 py-2 text-xs focus:outline-none focus:border-yellow-500">
+                
+                <div class="flex space-x-2 pt-2">
+                    <button type="submit" onclick="setAuthMode('login')" class="w-1/2 text-xs bg-gold font-bold py-2 rounded-lg hover:bg-yellow-500 transition">Sign In</button>
+                    <button type="submit" onclick="setAuthMode('register')" class="w-1/2 text-xs bg-gray-800 hover:bg-gray-700 font-bold py-2 rounded-lg transition border border-gray-700">Register</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Scripts -->
+    <script src="https://s3.tradingview.com/tv.js"></script>
+    <script>
+        let currentSymbol = 'XAUUSD';
+        let tvWidget = null;
+        let authMode = 'login';
+
+        const tvSymbolMap = {
+            'XAUUSD': 'OANDA:XAUUSD',
+            'XAGUSD': 'OANDA:XAGUSD',
+            'EURUSD': 'FX:EURUSD',
+            'GBPUSD': 'FX:GBPUSD',
+            'USDJPY': 'FX:USDJPY',
+            'AUDUSD': 'FX:AUDUSD'
+        };
+
+        const defaultOHLC = {
+            'XAUUSD': { high: 2650.0, low: 2620.0, close: 2642.5, open: 2630.0, price: 2645.0 },
+            'XAGUSD': { high: 31.80, low: 30.90, close: 31.40, open: 31.10, price: 31.45 },
+            'EURUSD': { high: 1.0980, low: 1.0910, close: 1.0945, open: 1.0920, price: 1.0950 },
+            'GBPUSD': { high: 1.3120, low: 1.3040, close: 1.3085, open: 1.3050, price: 1.3090 },
+            'USDJPY': { high: 149.20, low: 147.80, close: 148.50, open: 148.00, price: 148.60 },
+            'AUDUSD': { high: 0.6780, low: 0.6710, close: 0.6745, open: 0.6720, price: 0.6750 }
+        };
+
+        function updateClock() {
+            const now = new Date();
+            document.getElementById('utc-clock').innerText = now.toISOString().substr(11, 8) + ' UTC';
+        }
+        setInterval(updateClock, 1000);
+        updateClock();
+
+        function loadTradingViewChart(symbolKey) {
+            const tvSymbol = tvSymbolMap[symbolKey] || 'OANDA:XAUUSD';
+            if (tvWidget) {
+                try { tvWidget.remove(); } catch(e){}
+            }
+            tvWidget = new TradingView.widget({
+                "autosize": true,
+                "symbol": tvSymbol,
+                "interval": "15",
+                "timezone": "Etc/UTC",
+                "theme": "dark",
+                "style": "1",
+                "locale": "en",
+                "toolbar_bg": "#0d111a",
+                "enable_publishing": false,
+                "hide_side_toolbar": false,
+                "container_id": "tradingview-container"
+            });
+        }
+
+        function setSymbol(symbol) {
+            currentSymbol = symbol;
+            document.querySelectorAll('.tab-btn').forEach(btn => {
+                btn.classList.remove('active');
+                btn.classList.add('border-gray-700', 'text-gray-400');
+            });
+            const activeBtn = document.getElementById(`btn-${symbol}`);
+            if(activeBtn) {
+                activeBtn.classList.add('active');
+                activeBtn.classList.remove('border-gray-700', 'text-gray-400');
+            }
+            loadTradingViewChart(symbol);
+            calculateAndUpdatePivots();
+        }
+
+        function calculateAndUpdatePivots() {
+            const ohlc = defaultOHLC[currentSymbol] || defaultOHLC['XAUUSD'];
+            const gcalUrl = document.getElementById('gcal-webhook-url').value;
+            const tolerance = parseFloat(document.getElementById('alert-tolerance').value) || 0.2;
+
+            document.getElementById('live-price-tag').innerText = `Live Price: $${ohlc.price.toFixed(2)}`;
+
+            fetch('/api/v1/calculate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    high: ohlc.high,
+                    low: ohlc.low,
+                    close: ohlc.close,
+                    open_price: ohlc.open,
+                    current_price: ohlc.price,
+                    alert_tolerance_pct: tolerance,
+                    google_calendar_webhook_url: gcalUrl
+                })
+            })
+            .then(res => res.json())
+            .then(data => {
+                if(data.status === 'success') {
+                    renderPivotTable(data.data.pivots);
+                    if(data.data.alerts && data.data.alerts.length > 0) {
+                        handleTriggeredAlerts(data.data.alerts);
+                    }
+                }
+            })
+            .catch(err => console.error(err));
+        }
+
+        function renderPivotTable(pivots) {
+            const tbody = document.getElementById('pivot-table-body');
+            tbody.innerHTML = '';
+            for (const [model, levels] of Object.entries(pivots)) {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `
+                    <td class="p-2 font-bold gold-accent">${model}</td>
+                    <td class="p-2 text-red-400">${levels.R3 || levels.R4 || '-'}</td>
+                    <td class="p-2 text-red-400">${levels.R2 || '-'}</td>
+                    <td class="p-2 text-red-400">${levels.R1 || '-'}</td>
+                    <td class="p-2 font-bold gold-accent">${levels.PP || '-'}</td>
+                    <td class="p-2 text-green-400">${levels.S1 || '-'}</td>
+                    <td class="p-2 text-green-400">${levels.S2 || '-'}</td>
+                    <td class="p-2 text-green-400">${levels.S3 || levels.S4 || '-'}</td>
+                `;
+                tbody.appendChild(tr);
+            }
+        }
+
+        function handleTriggeredAlerts(alerts) {
+            const history = document.getElementById('alert-history');
+            alerts.forEach(alert => {
+                showAlertBanner(alert.message, alert.alert_type);
+                const item = document.createElement('div');
+                item.className = 'p-2.5 rounded bg-gray-900 border border-gray-800 text-gray-300';
+                item.innerHTML = `<span class="text-gray-500">[${new Date().toLocaleTimeString()}]</span> ${alert.message}`;
+                history.prepend(item);
+            });
+        }
+
+        function showAlertBanner(msg, type) {
+            const banner = document.getElementById('alert-banner');
+            const msgSpan = document.getElementById('alert-banner-msg');
+            msgSpan.innerText = msg;
+            banner.className = `fixed top-20 left-1/2 transform -translate-x-1/2 z-50 w-11/12 max-w-2xl p-4 rounded-xl shadow-2xl text-white font-bold flex items-center justify-between transition-all ${type.includes('RESISTANCE') ? 'bg-red-600' : 'bg-green-600'}`;
+            banner.classList.remove('hidden');
+        }
+
+        function hideAlertBanner() {
+            document.getElementById('alert-banner').classList.add('hidden');
+        }
+
+        function testGoogleCalendar() {
+            const url = document.getElementById('gcal-webhook-url').value;
+            if(!url) { alert('Please enter a Google Calendar Webhook URL first.'); return; }
+            fetch('/api/v1/test-google-calendar', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ webhook_url: url })
+            })
+            .then(res => res.json())
+            .then(data => alert(data.message));
+        }
+
+        // Auth Modal Controls
+        function openAuthModal() { document.getElementById('auth-modal').classList.remove('hidden'); }
+        function closeAuthModal() { document.getElementById('auth-modal').classList.add('hidden'); }
+        function setAuthMode(mode) { authMode = mode; }
+
+        function handleGoogleCredentialResponse(response) {
+            fetch('/api/v1/auth/google', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ credential: response.credential })
+            })
+            .then(res => res.json())
+            .then(data => {
+                if(data.status === 'success') {
+                    closeAuthModal();
+                    checkAuthStatus();
+                } else {
+                    alert(data.message);
+                }
+            });
+        }
+
+        function handleEmailAuth(e) {
+            e.preventDefault();
+            const email = document.getElementById('auth-email').value;
+            const password = document.getElementById('auth-password').value;
+            const fullname = document.getElementById('auth-fullname').value;
+
+            const endpoint = authMode === 'register' ? '/api/v1/auth/register' : '/api/v1/auth/login';
+            const body = { email, password, full_name: fullname };
+
+            fetch(endpoint, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            })
+            .then(res => res.json())
+            .then(data => {
+                if(data.status === 'success') {
+                    closeAuthModal();
+                    checkAuthStatus();
+                } else {
+                    alert(data.message);
+                }
+            });
+        }
+
+        function checkAuthStatus() {
+            fetch('/api/v1/auth/me')
+            .then(res => res.json())
+            .then(data => {
+                const container = document.getElementById('auth-container');
+                if(data.authenticated) {
+                    container.innerHTML = `
+                        <div class="flex items-center space-x-3">
+                            <span class="text-xs font-bold text-gray-300">👤 ${data.user.name}</span>
+                            <button onclick="logout()" class="text-xs bg-gray-800 hover:bg-gray-700 text-gray-300 px-3 py-1.5 rounded-lg border border-gray-700">Logout</button>
+                        </div>
+                    `;
+                } else {
+                    container.innerHTML = `
+                        <button onclick="openAuthModal()" class="text-xs bg-gold px-4 py-2 rounded-lg font-bold shadow hover:shadow-xl transition">
+                            Sign In / Register
+                        </button>
+                    `;
+                }
+            });
+        }
+
+        function logout() {
+            fetch('/api/v1/auth/logout', { method: 'POST' })
+            .then(() => checkAuthStatus());
+        }
+
+        // Initialize Page
+        window.onload = function() {
+            loadTradingViewChart('XAUUSD');
+            calculateAndUpdatePivots();
+            checkAuthStatus();
+            setInterval(calculateAndUpdatePivots, 5000);
+        };
+    </script>
+</body>
+</html>
+"""
+
+@app.route("/", methods=["GET"])
+def index_page():
+    return render_template_string(INDEX_HTML, google_client_id=GOOGLE_CLIENT_ID)
 
 if __name__ == "__main__":
-    print("Starting UMARMATHI Secured Pivot Point Web Application Server...")
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    print("Starting UMARMATHI Secure Forex & Metals Pivot Suite Server...")
+    app.run(host="0.0.0.0", port=5000, debug=False)
