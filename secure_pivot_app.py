@@ -1,25 +1,7 @@
-"""
-Secure Pivot Point Calculator & Alert System (OWASP Top 10 Compliant)
-===================================================================
-A production-ready Python web application built with Flask, Pydantic, and Security Hardening.
-Integrates live market data feeds, multi-model pivot calculations, and real-time alert thresholds.
-
-OWASP Top 10 Security Controls Applied:
----------------------------------------
-1. A01:2021-Broken Access Control: Strict symbol validation, rate limiting per IP.
-2. A02:2021-Cryptographic Failures: Environment variable key management, Secure Cookies (HttpOnly, SameSite).
-3. A03:2021-Injection: Type enforcement via Pydantic, no SQL/Command string concatenations.
-4. A04:2021-Insecure Design: Bounded threshold checks and rate limiting.
-5. A05:2021-Security Misconfiguration: Security Headers (CSP, X-Frame-Options, HSTS, X-Content-Type-Options).
-6. A07:2021-Identification/Auth Failures: CSRF protection, secure session tokens.
-7. A08:2021-Software/Data Integrity: Strict JSON schema validation for all API inputs.
-8. A09:2021-Security Logging & Monitoring: Audit logs for price alerts and security violations.
-9. A10:2021-SSRF Protection: Strict domain whitelisting and IP blocking for external market data requests.
-"""
-
 import os
 import re
 import logging
+import json
 from typing import Dict, Any, Optional
 from urllib.parse import urlparse
 import requests
@@ -31,19 +13,13 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] SECURITY_AUDIT: %(message)s'
 )
-logger = logging.getLogger("SecurePivotApp")
+logger = logging.getLogger("UmarmathiPivotEngine")
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get("FLASK_SECRET_KEY", os.urandom(32).hex())
 
-# Whitelisted Trading Data Providers (SSRF Mitigation)
-ALLOWED_DATA_PROVIDERS = {
-    "binance": "https://api.binance.com/api/v3/ticker/24hr",
-    "yahoo": "https://query1.finance.yahoo.com/v8/finance/chart/"
-}
-
-# Whitelisted Ticker Pattern (Regex injection prevention)
-TICKER_REGEX = re.compile(r"^[A-Z0-9\-]{2,10}$")
+# Whitelisted Ticker Pattern
+TICKER_REGEX = re.compile(r"^[A-Z0-9\-\:]{2,12}$")
 
 # OWASP Security Headers Middleware
 @app.after_request
@@ -53,43 +29,31 @@ def apply_security_headers(response):
     response.headers['X-XSS-Protection'] = '1; mode=block'
     response.headers['Content-Security-Policy'] = (
         "default-src 'self'; "
-        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
-        "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
-        "img-src 'self' data:; "
-        "connect-src 'self';"
+        "script-src 'self' 'unsafe-inline' https://s3.tradingview.com https://cdn.jsdelivr.net; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdn.jsdelivr.net; "
+        "font-src 'self' https://fonts.gstatic.com; "
+        "img-src 'self' data: https://s3.tradingview.com; "
+        "connect-src 'self' wss: https:;"
     )
     response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
     return response
 
-# Pydantic Input Validation Schemas
+# Pydantic Schemas
 class PivotRequestSchema(BaseModel):
-    high: float = Field(..., gt=0, description="Previous session high price")
-    low: float = Field(..., gt=0, description="Previous session low price")
-    close: float = Field(..., gt=0, description="Previous session close price")
-    open_price: Optional[float] = Field(None, gt=0, description="Previous session open price (required for DeMark)")
-    current_price: Optional[float] = Field(None, gt=0, description="Live market price")
-    alert_tolerance_pct: float = Field(0.2, ge=0.01, le=5.0, description="Alert proximity threshold in %")
+    high: float = Field(..., gt=0)
+    low: float = Field(..., gt=0)
+    close: float = Field(..., gt=0)
+    open_price: Optional[float] = Field(None, gt=0)
+    current_price: Optional[float] = Field(None, gt=0)
+    alert_tolerance_pct: float = Field(0.15, ge=0.01, le=3.0)
+    calendar_webhook_url: Optional[str] = Field(None)
 
-class MarketDataFetchSchema(BaseModel):
-    symbol: str = Field(..., min_length=2, max_length=10)
-    provider: str = Field("binance")
-
-def is_safe_url(url: str) -> bool:
-    """SSRF Prevention: Ensure URL belongs to explicit whitelist and non-internal IP."""
-    try:
-        parsed = urlparse(url)
-        if parsed.scheme not in ("http", "https"):
-            return False
-        host = parsed.hostname.lower() if parsed.hostname else ""
-        if host in ("localhost", "127.0.0.1", "0.0.0.0", "169.254.169.254") or host.startswith("10.") or host.startswith("192.168."):
-            return False
-        return any(whitelisted in host for whitelisted in ["binance.com", "yahoo.com"])
-    except Exception:
-        return False
+class WebhookTestSchema(BaseModel):
+    webhook_url: str = Field(...)
 
 def calculate_pivot_levels(high: float, low: float, close: float, open_price: Optional[float] = None) -> Dict[str, Any]:
-    """Mathematical Pivot Calculations for 5 Major Models."""
+    """Calculates Support and Resistance levels for 5 major calculation frameworks."""
     rng = high - low
     
     # 1. Standard / Classic
@@ -149,7 +113,7 @@ def calculate_pivot_levels(high: float, low: float, close: float, open_price: Op
     }
 
 def evaluate_price_alerts(current_price: float, pivot_levels: Dict[str, Any], tolerance_pct: float) -> list:
-    """Checks if live price is within tolerance threshold of any support or resistance level."""
+    """Evaluates proximity to Support and Resistance zones."""
     alerts = []
     for model_name, levels in pivot_levels.items():
         for level_name, level_val in levels.items():
@@ -157,7 +121,7 @@ def evaluate_price_alerts(current_price: float, pivot_levels: Dict[str, Any], to
                 continue
             diff_pct = abs(current_price - level_val) / level_val * 100.0
             if diff_pct <= tolerance_pct:
-                alert_type = "RESISTANCE_NEAR" if "R" in level_name else ("SUPPORT_NEAR" if "S" in level_name else "PIVOT_NEAR")
+                alert_type = "RESISTANCE_TRIGGER" if "R" in level_name else ("SUPPORT_TRIGGER" if "S" in level_name else "PIVOT_TOUCH")
                 alerts.append({
                     "model": model_name,
                     "level": level_name,
@@ -165,205 +129,563 @@ def evaluate_price_alerts(current_price: float, pivot_levels: Dict[str, Any], to
                     "current_price": current_price,
                     "difference_pct": round(diff_pct, 3),
                     "alert_type": alert_type,
-                    "message": f"🚨 {alert_type}: Current price ({current_price}) is within {diff_pct:.2f}% of {model_name} {level_name} ({level_val})"
+                    "message": f"🚨 {alert_type}: Price ({current_price}) reached {model_name} {level_name} ({level_val})"
                 })
     return alerts
 
-# HTML Dashboard Template for Website
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="en" data-bs-theme="dark">
+def dispatch_calendar_webhook(webhook_url: str, alert_payload: dict):
+    """Safely dispatches alert notification to user's Calendar/Clock webhook."""
+    try:
+        parsed = urlparse(webhook_url)
+        if parsed.scheme not in ("http", "https"):
+            return
+        # Avoid internal IP targeting
+        host = parsed.hostname.lower() if parsed.hostname else ""
+        if host in ("localhost", "127.0.0.1", "0.0.0.0", "169.254.169.254"):
+            return
+        requests.post(webhook_url, json=alert_payload, timeout=3)
+    except Exception as e:
+        logger.warning(f"Webhook dispatch notification failed: {e}")
+
+# Frontend Template
+INDEX_HTML = """<!DOCTYPE html>
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Secure Pivot Point Calculator & Alert Engine</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <title>UMARMATHI | Forex & Metals Institutional Pivot Engine</title>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
     <style>
-        body { background-color: #0f172a; color: #f8fafc; font-family: system-ui, -apple-system, sans-serif; }
-        .card { background-color: #1e293b; border: 1px solid #334155; }
-        .form-control, .form-select { background-color: #0f172a; border-color: #334155; color: #f8fafc; }
-        .form-control:focus { background-color: #0f172a; color: #f8fafc; border-color: #3b82f6; box-shadow: none; }
-        .badge-alert { background-color: #ef4444; color: white; }
-        .badge-support { background-color: #10b981; color: white; }
-        .badge-resistance { background-color: #f59e0b; color: white; }
+        :root {
+            --bg-primary: #0A0D14;
+            --bg-card: #121722;
+            --bg-input: #182030;
+            --border-color: #232D42;
+            --accent-gold: #D4AF37;
+            --accent-gold-hover: #F59E0B;
+            --accent-green: #10B981;
+            --accent-red: #EF4444;
+            --text-primary: #F3F4F6;
+            --text-secondary: #9CA3AF;
+            --text-muted: #6B7280;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Plus Jakarta Sans', sans-serif; }
+        body { background-color: var(--bg-primary); color: var(--text-primary); min-height: 100vh; display: flex; flex-direction: column; }
+        
+        /* Top Navigation Header */
+        header {
+            background-color: var(--bg-card);
+            border-bottom: 1px solid var(--border-color);
+            padding: 16px 28px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .brand-container { display: flex; align-items: center; gap: 14px; }
+        .brand-logo {
+            background: linear-gradient(135deg, var(--accent-gold), #F59E0B);
+            color: #000;
+            font-weight: 800;
+            font-size: 18px;
+            padding: 8px 14px;
+            border-radius: 8px;
+            letter-spacing: 1.5px;
+        }
+        .brand-title { font-weight: 700; font-size: 18px; color: var(--text-primary); }
+        .brand-sub { font-size: 12px; color: var(--text-secondary); margin-top: 2px; }
+
+        .time-badge {
+            background: var(--bg-input);
+            border: 1px solid var(--border-color);
+            padding: 8px 16px;
+            border-radius: 8px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 13px;
+            color: var(--accent-gold);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .pulse-dot { width: 8px; height: 8px; background-color: var(--accent-green); border-radius: 50%; animation: pulse 1.5s infinite; }
+
+        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.3; } 100% { opacity: 1; } }
+
+        /* Main Container */
+        .main-layout {
+            display: grid;
+            grid-template-columns: 1fr 420px;
+            gap: 20px;
+            padding: 24px;
+            max-width: 1750px;
+            margin: 0 auto;
+            width: 100%;
+            flex: 1;
+        }
+
+        /* Symbol Preset Switcher */
+        .symbol-bar {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 16px;
+            overflow-x: auto;
+            padding-bottom: 4px;
+        }
+        .symbol-btn {
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            color: var(--text-secondary);
+            padding: 10px 18px;
+            border-radius: 8px;
+            font-weight: 600;
+            font-size: 13px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            white-space: nowrap;
+        }
+        .symbol-btn:hover { border-color: var(--accent-gold); color: var(--text-primary); }
+        .symbol-btn.active {
+            background: rgba(212, 175, 55, 0.12);
+            border-color: var(--accent-gold);
+            color: var(--accent-gold);
+        }
+
+        /* Card Panels */
+        .panel {
+            background-color: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        .panel-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 12px;
+        }
+        .panel-title { font-weight: 700; font-size: 15px; color: var(--text-primary); display: flex; align-items: center; gap: 8px; }
+
+        /* Chart Container */
+        .chart-wrapper {
+            height: 520px;
+            border-radius: 8px;
+            overflow: hidden;
+            border: 1px solid var(--border-color);
+            background-color: #000;
+        }
+
+        /* Inputs Form Grid */
+        .form-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 14px;
+        }
+        .form-group { display: flex; flex-direction: column; gap: 6px; }
+        .form-group label { font-size: 12px; font-weight: 600; color: var(--text-secondary); }
+        .form-control {
+            background-color: var(--bg-input);
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            padding: 10px 14px;
+            border-radius: 8px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 14px;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        .form-control:focus { border-color: var(--accent-gold); }
+
+        .btn-primary {
+            background: linear-gradient(135deg, var(--accent-gold), var(--accent-gold-hover));
+            color: #000;
+            font-weight: 700;
+            font-size: 14px;
+            padding: 12px 20px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            transition: opacity 0.2s;
+            width: 100%;
+            margin-top: 10px;
+        }
+        .btn-primary:hover { opacity: 0.9; }
+
+        /* Pivot Results Tables */
+        .pivot-tabs { display: flex; gap: 8px; margin-bottom: 12px; border-bottom: 1px solid var(--border-color); padding-bottom: 8px; }
+        .tab-btn {
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            font-weight: 600;
+            font-size: 12px;
+            padding: 6px 12px;
+            cursor: pointer;
+            border-radius: 6px;
+        }
+        .tab-btn.active { background: var(--bg-input); color: var(--accent-gold); }
+
+        .pivot-table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+        .pivot-table th, .pivot-table td {
+            padding: 10px 12px;
+            text-align: left;
+            font-size: 13px;
+            border-bottom: 1px solid rgba(35, 45, 66, 0.5);
+        }
+        .pivot-table th { color: var(--text-secondary); font-weight: 600; font-size: 11px; text-transform: uppercase; }
+        .level-tag { font-family: 'JetBrains Mono', monospace; font-weight: 700; padding: 2px 6px; border-radius: 4px; font-size: 11px; }
+        .tag-res { background: rgba(239, 68, 68, 0.15); color: var(--accent-red); }
+        .tag-pp { background: rgba(212, 175, 55, 0.15); color: var(--accent-gold); }
+        .tag-sup { background: rgba(16, 185, 129, 0.15); color: var(--accent-green); }
+
+        /* Alert & Calendar Integration Box */
+        .webhook-box {
+            background: var(--bg-input);
+            border: 1px dashed var(--accent-gold);
+            padding: 16px;
+            border-radius: 10px;
+            margin-top: 14px;
+        }
+        .webhook-box h4 { font-size: 13px; color: var(--accent-gold); margin-bottom: 8px; display: flex; align-items: center; gap: 6px; }
+        .webhook-box p { font-size: 11px; color: var(--text-secondary); margin-bottom: 12px; line-height: 1.4; }
+
+        .alert-feed { max-height: 160px; overflow-y: auto; margin-top: 10px; }
+        .alert-item {
+            background: rgba(239, 68, 68, 0.1);
+            border-left: 3px solid var(--accent-red);
+            padding: 8px 12px;
+            border-radius: 4px;
+            font-size: 12px;
+            margin-bottom: 6px;
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        @media (max-width: 1024px) {
+            .main-layout { grid-template-columns: 1fr; }
+        }
     </style>
 </head>
-<body class="py-4">
-    <div class="container max-w-5xl">
-        <header class="d-flex justify-content-between align-items-center mb-4 pb-3 border-bottom border-secondary">
+<body>
+
+    <header>
+        <div class="brand-container">
+            <div class="brand-logo">UMARMATHI</div>
             <div>
-                <h2 class="fw-bold mb-0 text-primary">📈 Secure Pivot Point Engine</h2>
-                <small class="text-muted">OWASP Top 10 Hardened Trading Suite</small>
-            </div>
-            <span class="badge bg-success">Status: Live & Protected</span>
-        </header>
-
-        <div class="row g-4">
-            <!-- Input Form -->
-            <div class="col-md-5">
-                <div class="card p-4 shadow-sm">
-                    <h5 class="fw-bold mb-3 text-light">Market Inputs</h5>
-                    
-                    <!-- Fetch Live Feed -->
-                    <div class="mb-3 p-3 rounded bg-dark border border-secondary">
-                        <label class="form-label small fw-bold text-info">Fetch Live Market Engine (Binance)</label>
-                        <div class="input-group input-group-sm">
-                            <input type="text" id="symbol_input" class="form-control" placeholder="e.g. BTC, ETH, SOL" value="BTC">
-                            <button class="btn btn-info fw-bold" onclick="fetchLiveMarketData()">Fetch Feed</button>
-                        </div>
-                    </div>
-
-                    <form id="pivotForm">
-                        <div class="row g-2 mb-2">
-                            <div class="col-6">
-                                <label class="form-label small">High Price</label>
-                                <input type="number" step="any" id="high" class="form-control" required value="150.0">
-                            </div>
-                            <div class="col-6">
-                                <label class="form-label small">Low Price</label>
-                                <input type="number" step="any" id="low" class="form-control" required value="140.0">
-                            </div>
-                        </div>
-                        <div class="row g-2 mb-2">
-                            <div class="col-6">
-                                <label class="form-label small">Close Price</label>
-                                <input type="number" step="any" id="close" class="form-control" required value="145.0">
-                            </div>
-                            <div class="col-6">
-                                <label class="form-label small">Open Price (DeMark)</label>
-                                <input type="number" step="any" id="open_price" class="form-control" value="142.0">
-                            </div>
-                        </div>
-                        <div class="mb-3">
-                            <label class="form-label small">Current Live Price (for Alert Trigger)</label>
-                            <input type="number" step="any" id="current_price" class="form-control" value="150.1">
-                        </div>
-                        <div class="mb-3">
-                            <label class="form-label small">Alert Tolerance Threshold (%)</label>
-                            <input type="number" step="0.1" id="alert_tolerance_pct" class="form-control" value="0.5">
-                        </div>
-                        <button type="button" class="btn btn-primary w-100 fw-bold" onclick="calculatePivots()">Calculate & Run Alert Check</button>
-                    </form>
-                </div>
-            </div>
-
-            <!-- Results & Alerts -->
-            <div class="col-md-7">
-                <!-- Alerts Container -->
-                <div id="alertsContainer" class="mb-3"></div>
-
-                <!-- Pivot Results Cards -->
-                <div id="pivotResults" class="card p-4 shadow-sm">
-                    <h5 class="fw-bold mb-3">Calculated Pivot Levels</h5>
-                    <p class="text-muted small">Enter market parameters and click Calculate to display the multi-model pivot matrix.</p>
-                </div>
+                <div class="brand-title">Forex & Metals Institutional Pivot Engine</div>
+                <div class="brand-sub">Real-Time Precision Support & Resistance Analytics</div>
             </div>
         </div>
+        <div class="time-badge">
+            <div class="pulse-dot"></div>
+            <span id="utc-clock">00:00:00 UTC</span>
+        </div>
+    </header>
+
+    <div class="main-layout">
+        
+        <!-- Left Column: Chart & OHLC Setup -->
+        <div>
+            <!-- Symbol Selector Bar -->
+            <div class="symbol-bar">
+                <button class="symbol-btn active" onclick="setSymbol('OANDA:XAUUSD', 'Gold / US Dollar', 2650.50, 2632.10, 2645.80, 2638.00)">🥇 XAU/USD (Gold)</button>
+                <button class="symbol-btn" onclick="setSymbol('OANDA:XAGUSD', 'Silver / US Dollar', 31.85, 31.20, 31.60, 31.35)">🥈 XAG/USD (Silver)</button>
+                <button class="symbol-btn" onclick="setSymbol('FX:EURUSD', 'Euro / US Dollar', 1.0980, 1.0910, 1.0955, 1.0925)">🇪🇺 EUR/USD</button>
+                <button class="symbol-btn" onclick="setSymbol('FX:GBPUSD', 'British Pound / USD', 1.3120, 1.3030, 1.3085, 1.3045)">🇬🇧 GBP/USD</button>
+                <button class="symbol-btn" onclick="setSymbol('FX:USDJPY', 'USD / Japanese Yen', 149.20, 147.80, 148.60, 148.10)">🇯🇵 USD/JPY</button>
+                <button class="symbol-btn" onclick="setSymbol('FX:AUDUSD', 'Australian Dollar / USD', 0.6780, 0.6710, 0.6745, 0.6720)">🇦🇺 AUD/USD</button>
+            </div>
+
+            <!-- TradingView Live Chart Panel -->
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title" id="active-symbol-title">🥇 OANDA:XAUUSD — Live Institutional Chart</div>
+                    <span style="font-size: 12px; color: var(--accent-green);" id="live-tick-status">● Live Feed Stream Active</span>
+                </div>
+                <div class="chart-wrapper" id="tv_chart_container"></div>
+            </div>
+
+            <!-- Manual / Quick Session Input Form -->
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title">⚙️ Session Parameters & Proximity Thresholds</div>
+                </div>
+                <div class="form-grid">
+                    <div class="form-group">
+                        <label>Previous High</label>
+                        <input type="number" step="0.0001" id="input-high" class="form-control" value="2650.50">
+                    </div>
+                    <div class="form-group">
+                        <label>Previous Low</label>
+                        <input type="number" step="0.0001" id="input-low" class="form-control" value="2632.10">
+                    </div>
+                    <div class="form-group">
+                        <label>Previous Close</label>
+                        <input type="number" step="0.0001" id="input-close" class="form-control" value="2645.80">
+                    </div>
+                    <div class="form-group">
+                        <label>Previous Open</label>
+                        <input type="number" step="0.0001" id="input-open" class="form-control" value="2638.00">
+                    </div>
+                    <div class="form-group">
+                        <label>Live Price</label>
+                        <input type="number" step="0.0001" id="input-current" class="form-control" value="2649.80">
+                    </div>
+                    <div class="form-group">
+                        <label>Alert Sensitivity (%)</label>
+                        <input type="number" step="0.05" id="input-tolerance" class="form-control" value="0.15">
+                    </div>
+                </div>
+                <button class="btn-primary" onclick="calculatePivots()">Calculate & Sync Alert Thresholds</button>
+            </div>
+        </div>
+
+        <!-- Right Column: Pivot Levels & Calendar Integration -->
+        <div>
+            
+            <!-- Calculated Pivots Monitor -->
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title">🎯 Calculated Pivot Levels</div>
+                </div>
+                <div class="pivot-tabs">
+                    <button class="tab-btn active" onclick="switchPivotTab('Standard')">Standard</button>
+                    <button class="tab-btn" onclick="switchPivotTab('Fibonacci')">Fibonacci</button>
+                    <button class="tab-btn" onclick="switchPivotTab('Woodie')">Woodie</button>
+                    <button class="tab-btn" onclick="switchPivotTab('Camarilla')">Camarilla</button>
+                    <button class="tab-btn" onclick="switchPivotTab('DeMark')">DeMark</button>
+                </div>
+                <table class="pivot-table">
+                    <thead>
+                        <tr>
+                            <th>Level</th>
+                            <th>Target Price</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody id="pivot-rows">
+                        <!-- Populated by JavaScript -->
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- Calendar & Clock Webhook Sync Panel -->
+            <div class="panel">
+                <div class="panel-header">
+                    <div class="panel-title">🔔 Calendar / Clock Alert Sync</div>
+                </div>
+                
+                <div class="webhook-box">
+                    <h4>📅 Link to Calendar / Clock Webhook</h4>
+                    <p>Enter your Google Calendar, iCal, Zapier, Make, or Smart Clock Webhook URL. When price hits a Support or Resistance zone, an automated alert trigger will post directly to your calendar/clock feed.</p>
+                    <input type="text" id="webhook-url" class="form-control" placeholder="https://maker.ifttt.com/trigger/pivot_alert/with/key/..." style="width: 100%; font-size: 12px; margin-bottom: 10px;">
+                    <div style="display: flex; gap: 8px;">
+                        <button class="btn-primary" style="margin-top: 0; font-size: 12px; padding: 8px;" onclick="testWebhook()">Test Calendar Sync</button>
+                        <button class="btn-primary" style="margin-top: 0; font-size: 12px; padding: 8px; background: #374151; color: #FFF;" onclick="toggleAudioChime()">🔊 Sound Chime: ON</button>
+                    </div>
+                </div>
+
+                <div style="margin-top: 16px;">
+                    <div style="font-size: 12px; font-weight: 600; color: var(--text-secondary); margin-bottom: 8px;">Real-Time Alert Feed Log</div>
+                    <div class="alert-feed" id="alert-feed-box">
+                        <div style="font-size: 12px; color: var(--text-muted); text-align: center; padding: 12px;">No active level triggers detected yet.</div>
+                    </div>
+                </div>
+
+            </div>
+
+        </div>
+
     </div>
 
+    <!-- TradingView Script -->
+    <script src="https://s3.tradingview.com/tv.js"></script>
     <script>
-        async function fetchLiveMarketData() {
-            const sym = document.getElementById('symbol_input').value.trim();
-            if (!sym) return alert('Enter ticker symbol');
-            try {
-                const res = await fetch('/api/v1/fetch-market-data', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({symbol: sym, provider: 'binance'})
-                });
-                const data = await res.json();
-                if (data.status === 'success') {
-                    document.getElementById('high').value = data.ohlc.high;
-                    document.getElementById('low').value = data.ohlc.low;
-                    document.getElementById('close').value = data.ohlc.close;
-                    document.getElementById('open_price').value = data.ohlc.open;
-                    document.getElementById('current_price').value = data.ohlc.current;
-                    calculatePivots();
-                } else {
-                    alert('Error: ' + data.message);
-                }
-            } catch (err) {
-                alert('Connection error');
-            }
+        let currentTVWidget = null;
+        let activePivotData = null;
+        let currentPivotFramework = 'Standard';
+        let audioEnabled = true;
+
+        function updateUTCClock() {
+            const now = new Date();
+            document.getElementById('utc-clock').innerText = now.toUTCString().split(' ')[4] + ' UTC';
+        }
+        setInterval(updateUTCClock, 1000);
+        updateUTCClock();
+
+        function loadTradingViewChart(symbolName) {
+            document.getElementById('tv_chart_container').innerHTML = '';
+            currentTVWidget = new TradingView.widget({
+                "autosize": true,
+                "symbol": symbolName,
+                "interval": "15",
+                "timezone": "Etc/UTC",
+                "theme": "dark",
+                "style": "1",
+                "locale": "en",
+                "toolbar_bg": "#121722",
+                "enable_publishing": false,
+                "hide_side_toolbar": false,
+                "container_id": "tv_chart_container"
+            });
         }
 
-        async function calculatePivots() {
-            const req = {
-                high: parseFloat(document.getElementById('high').value),
-                low: parseFloat(document.getElementById('low').value),
-                close: parseFloat(document.getElementById('close').value),
-                open_price: parseFloat(document.getElementById('open_price').value) || null,
-                current_price: parseFloat(document.getElementById('current_price').value) || null,
-                alert_tolerance_pct: parseFloat(document.getElementById('alert_tolerance_pct').value) || 0.5
+        function setSymbol(symbol, title, high, low, close, open) {
+            document.querySelectorAll('.symbol-btn').forEach(btn => btn.classList.remove('active'));
+            event.target.classList.add('active');
+            document.getElementById('active-symbol-title').innerText = `🥇 ${symbol} — Live Institutional Chart`;
+            
+            document.getElementById('input-high').value = high;
+            document.getElementById('input-low').value = low;
+            document.getElementById('input-close').value = close;
+            document.getElementById('input-open').value = open;
+            
+            loadTradingViewChart(symbol);
+            calculatePivots();
+        }
+
+        function calculatePivots() {
+            const payload = {
+                high: parseFloat(document.getElementById('input-high').value),
+                low: parseFloat(document.getElementById('input-low').value),
+                close: parseFloat(document.getElementById('input-close').value),
+                open_price: parseFloat(document.getElementById('input-open').value),
+                current_price: parseFloat(document.getElementById('input-current').value),
+                alert_tolerance_pct: parseFloat(document.getElementById('input-tolerance').value),
+                calendar_webhook_url: document.getElementById('webhook-url').value
             };
 
-            try {
-                const res = await fetch('/api/v1/calculate', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(req)
-                });
-                const resp = await res.json();
-                if (resp.status !== 'success') {
-                    alert('Validation error: ' + resp.message);
-                    return;
+            fetch('/api/v1/calculate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            })
+            .then(res => res.json())
+            .then(data => {
+                if (data.status === 'success') {
+                    activePivotData = data.data.pivots;
+                    renderPivotTable();
+                    renderAlerts(data.data.alerts);
+                }
+            });
+        }
+
+        function switchPivotTab(framework) {
+            currentPivotFramework = framework;
+            document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
+            event.target.classList.add('active');
+            renderPivotTable();
+        }
+
+        function renderPivotTable() {
+            if (!activePivotData || !activePivotData[currentPivotFramework]) return;
+            const levels = activePivotData[currentPivotFramework];
+            const currentPrice = parseFloat(document.getElementById('input-current').value);
+            const tbody = document.getElementById('pivot-rows');
+            tbody.innerHTML = '';
+
+            for (const [level, val] of Object.entries(levels)) {
+                if (val === null) continue;
+                let tagClass = 'tag-pp';
+                if (level.includes('R')) tagClass = 'tag-res';
+                if (level.includes('S')) tagClass = 'tag-sup';
+
+                const diff = Math.abs(currentPrice - val) / val * 100;
+                let statusText = `<span style="color: var(--text-muted);">${diff.toFixed(2)}% away</span>`;
+                if (diff <= parseFloat(document.getElementById('input-tolerance').value)) {
+                    statusText = `<span style="color: var(--accent-gold); font-weight:700;">🚨 IN ZONE</span>`;
                 }
 
-                // Render Alerts
-                const alertDiv = document.getElementById('alertsContainer');
-                alertDiv.innerHTML = '';
-                if (resp.data.alerts && resp.data.alerts.length > 0) {
-                    resp.data.alerts.forEach(a => {
-                        const alertBox = document.createElement('div');
-                        alertBox.className = 'alert alert-danger shadow-sm border-0 d-flex justify-content-between align-items-center mb-2';
-                        alertBox.innerHTML = `<div><strong>${a.message}</strong></div><span class="badge badge-alert">ALERT TRIGGERED</span>`;
-                        alertDiv.appendChild(alertBox);
-                    });
-                } else {
-                    alertDiv.innerHTML = '<div class="alert alert-success border-0 small mb-2">✅ No price level alerts triggered within current tolerance zone.</div>';
-                }
-
-                // Render Tables
-                const pivots = resp.data.pivots;
-                let html = '<div class="table-responsive"><table class="table table-dark table-striped small align-middle"><thead><tr><th>Model</th><th>PP</th><th>R1</th><th>S1</th><th>R2</th><th>S2</th></tr></thead><tbody>';
-                
-                for (const [model, levels] of Object.entries(pivots)) {
-                    html += `<tr><td class="fw-bold text-info">${model}</td><td>${levels.PP || '-'}</td><td>${levels.R1 || '-'}</td><td>${levels.S1 || '-'}</td><td>${levels.R2 || '-'}</td><td>${levels.S2 || '-'}</td></tr>`;
-                }
-                html += '</tbody></table></div>';
-                document.getElementById('pivotResults').innerHTML = '<h5 class="fw-bold mb-3">Calculated Pivot Matrix</h5>' + html;
-
-            } catch (err) {
-                alert('Calculation failed');
+                tbody.innerHTML += `
+                    <tr>
+                        <td><span class="level-tag ${tagClass}">${level}</span></td>
+                        <td style="font-family: 'JetBrains Mono', monospace; font-weight:700;">$${val.toFixed(2)}</td>
+                        <td>${statusText}</td>
+                    </tr>
+                `;
             }
         }
-        
-        window.onload = calculatePivots;
+
+        function renderAlerts(alerts) {
+            const box = document.getElementById('alert-feed-box');
+            if (!alerts || alerts.length === 0) {
+                box.innerHTML = `<div style="font-size: 12px; color: var(--text-muted); text-align: center; padding: 12px;">No active level triggers detected yet.</div>`;
+                return;
+            }
+            box.innerHTML = '';
+            alerts.forEach(a => {
+                box.innerHTML += `<div class="alert-item">${a.message}</div>`;
+            });
+
+            if (audioEnabled && alerts.length > 0) {
+                playChimeSound();
+            }
+        }
+
+        function playChimeSound() {
+            try {
+                const ctx = new (window.AudioContext || window.webkitAudioContext)();
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.type = 'sine';
+                osc.frequency.value = 880; // A5 pitch
+                gain.gain.setValueAtTime(0.1, ctx.currentTime);
+                osc.connect(gain);
+                gain.connect(ctx.destination);
+                osc.start();
+                osc.stop(ctx.currentTime + 0.25);
+            } catch(e){}
+        }
+
+        function toggleAudioChime() {
+            audioEnabled = !audioEnabled;
+            event.target.innerText = audioEnabled ? "🔊 Sound Chime: ON" : "🔇 Sound Chime: OFF";
+        }
+
+        function testWebhook() {
+            const url = document.getElementById('webhook-url').value;
+            if (!url) {
+                alert("Please enter a valid Calendar/Clock Webhook URL first.");
+                return;
+            }
+            fetch('/api/v1/webhook-test', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ webhook_url: url })
+            })
+            .then(res => res.json())
+            .then(data => alert(data.message));
+        }
+
+        // Initialize default view
+        window.onload = function() {
+            loadTradingViewChart('OANDA:XAUUSD');
+            calculatePivots();
+        };
     </script>
 </body>
 </html>
 """
 
-# Web Routes
-@app.route("/", methods=["GET"])
+# API Routes
+@app.route("/")
 def index():
-    """Serves the interactive web interface."""
-    return render_template_string(HTML_TEMPLATE)
+    """Serves the institutional UMARMATHI trading dashboard."""
+    return render_template_string(INDEX_HTML)
 
-@app.route("/health", methods=["GET"])
-def health_check():
-    """Service health monitoring endpoint."""
-    return jsonify({"service": "SecurePivotApp", "status": "healthy", "version": "1.0.0"}), 200
+@app.route("/health")
+def health():
+    return jsonify({"status": "healthy", "service": "UMARMATHI Pivot Engine", "version": "2.0.0"}), 200
 
-# API Endpoints
 @app.route("/api/v1/calculate", methods=["POST"])
 def api_calculate_pivots():
-    """Secure endpoint to calculate pivots and trigger price level proximity alerts."""
+    """Calculates pivots, evaluates proximity alerts, and dispatches calendar/clock webhooks."""
     try:
         data = request.get_json(force=True)
         validated = PivotRequestSchema(**data)
     except ValidationError as e:
-        logger.warning(f"Input validation error: {e.errors()}")
         return jsonify({"status": "error", "message": "Invalid input parameters", "details": e.errors()}), 400
     except Exception:
         return jsonify({"status": "error", "message": "Malformed JSON payload"}), 400
@@ -373,61 +695,36 @@ def api_calculate_pivots():
     alerts = []
     if validated.current_price:
         alerts = evaluate_price_alerts(validated.current_price, pivots, validated.alert_tolerance_pct)
-        if alerts:
-            logger.info(f"Triggered {len(alerts)} price alerts for current price {validated.current_price}")
+        if alerts and validated.calendar_webhook_url:
+            dispatch_calendar_webhook(validated.calendar_webhook_url, {
+                "event": "SUPPORT_RESISTANCE_ALERT",
+                "symbol": "FOREX_METALS",
+                "alerts": alerts,
+                "alert_count": len(alerts)
+            })
 
     return jsonify({
         "status": "success",
         "data": {
-            "inputs": validated.dict(),
             "pivots": pivots,
             "alerts": alerts,
             "alert_count": len(alerts)
         }
     }), 200
 
-@app.route("/api/v1/fetch-market-data", methods=["POST"])
-def api_fetch_market_data():
-    """SSRF-Protected endpoint to fetch live OHLC from external trading engines."""
+@app.route("/api/v1/webhook-test", methods=["POST"])
+def api_webhook_test():
+    """Tests connection to user's Calendar/Clock webhook."""
     try:
         data = request.get_json(force=True)
-        validated = MarketDataFetchSchema(**data)
-    except ValidationError as e:
-        return jsonify({"status": "error", "message": "Invalid symbol or provider format"}), 400
-
-    symbol = validated.symbol.upper()
-    if not TICKER_REGEX.match(symbol):
-        logger.warning(f"Invalid ticker pattern attempt: {symbol}")
-        return jsonify({"status": "error", "message": "Invalid ticker symbol format"}), 400
-
-    if validated.provider not in ALLOWED_DATA_PROVIDERS:
-        return jsonify({"status": "error", "message": "Provider not supported"}), 400
-
-    target_url = ALLOWED_DATA_PROVIDERS[validated.provider]
-    if not is_safe_url(target_url):
-        logger.error(f"SSRF violation attempt blocked: {target_url}")
-        return jsonify({"status": "error", "message": "Security policy violation"}), 403
-
-    try:
-        if validated.provider == "binance":
-            resp = requests.get(target_url, params={"symbol": f"{symbol}USDT"}, timeout=5)
-            if resp.status_code == 200:
-                res_data = resp.json()
-                high = float(res_data["highPrice"])
-                low = float(res_data["lowPrice"])
-                close = float(res_data["lastPrice"])
-                open_p = float(res_data["openPrice"])
-                return jsonify({
-                    "status": "success",
-                    "symbol": symbol,
-                    "ohlc": {"high": high, "low": low, "close": close, "open": open_p, "current": close}
-                })
-    except Exception as err:
-        logger.error(f"Trading API connection error: {err}")
-        return jsonify({"status": "error", "message": "Unable to connect to live market engine"}), 502
-
-    return jsonify({"status": "error", "message": "Data unavailable"}), 404
+        validated = WebhookTestSchema(**data)
+        dispatch_calendar_webhook(validated.webhook_url, {
+            "event": "CALENDAR_SYNC_TEST",
+            "message": "✅ UMARMATHI Calendar & Clock Webhook Sync Successful!"
+        })
+        return jsonify({"status": "success", "message": "Sync payload dispatched to your Calendar/Clock webhook!"}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": f"Webhook test failed: {e}"}), 400
 
 if __name__ == "__main__":
-    print("Starting OWASP Top 10 Secured Pivot Point Web Application Server...")
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(host="127.0.0.1", port=5000, debug=False)
