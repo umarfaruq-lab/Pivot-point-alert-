@@ -2,19 +2,8 @@
 Secure Pivot Point Calculator & Alert System (OWASP Top 10 Compliant)
 ===================================================================
 A production-ready Python web application built with Flask, Pydantic, and Security Hardening.
-Integrates live market data feeds, multi-model pivot calculations, and real-time alert thresholds.
-
-OWASP Top 10 Security Controls Applied:
----------------------------------------
-1. A01:2021-Broken Access Control: Strict symbol validation, rate limiting per IP.
-2. A02:2021-Cryptographic Failures: Environment variable key management, Secure Cookies (HttpOnly, SameSite).
-3. A03:2021-Injection: Type enforcement via Pydantic, no SQL/Command string concatenations.
-4. A04:2021-Insecure Design: Bounded threshold checks and rate limiting.
-5. A05:2021-Security Misconfiguration: Security Headers (CSP, X-Frame-Options, HSTS, X-Content-Type-Options).
-6. A07:2021-Identification/Auth Failures: CSRF protection, secure session tokens.
-7. A08:2021-Software/Data Integrity: Strict JSON schema validation for all API inputs.
-8. A09:2021-Security Logging & Monitoring: Audit logs for price alerts and security violations.
-9. A10:2021-SSRF Protection: Strict domain whitelisting and IP blocking for external market data requests.
+Integrates live market data feeds, multi-model pivot calculations, real-time alert thresholds,
+and an embedded TradingView interactive charting interface with live WebSockets.
 """
 
 import os
@@ -53,10 +42,11 @@ def apply_security_headers(response):
     response.headers['X-XSS-Protection'] = '1; mode=block'
     response.headers['Content-Security-Policy'] = (
         "default-src 'self'; "
-        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+        "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://s3.tradingview.com https://unpkg.com; "
         "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
-        "img-src 'self' data:; "
-        "connect-src 'self';"
+        "img-src 'self' data: https://s3.tradingview.com; "
+        "connect-src 'self' https://api.binance.com wss://stream.binance.com:9443; "
+        "frame-src 'self' https://s.tradingview.com https://www.tradingview-widget.com;"
     )
     response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
     response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
@@ -67,7 +57,7 @@ class PivotRequestSchema(BaseModel):
     high: float = Field(..., gt=0, description="Previous session high price")
     low: float = Field(..., gt=0, description="Previous session low price")
     close: float = Field(..., gt=0, description="Previous session close price")
-    open_price: Optional[float] = Field(None, gt=0, description="Previous session open price (required for DeMark)")
+    open_price: Optional[float] = Field(None, gt=0, description="Previous session open price")
     current_price: Optional[float] = Field(None, gt=0, description="Live market price")
     alert_tolerance_pct: float = Field(0.2, ge=0.01, le=5.0, description="Alert proximity threshold in %")
 
@@ -169,193 +159,277 @@ def evaluate_price_alerts(current_price: float, pivot_levels: Dict[str, Any], to
                 })
     return alerts
 
-# HTML Dashboard Template for Website
-HTML_TEMPLATE = """
+# HTML Dashboard Template
+INDEX_HTML = """
 <!DOCTYPE html>
-<html lang="en" data-bs-theme="dark">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Secure Pivot Point Calculator & Alert Engine</title>
+    <title>Secure Pivot Point Calculator & Live Trading Chart</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
-        body { background-color: #0f172a; color: #f8fafc; font-family: system-ui, -apple-system, sans-serif; }
-        .card { background-color: #1e293b; border: 1px solid #334155; }
-        .form-control, .form-select { background-color: #0f172a; border-color: #334155; color: #f8fafc; }
+        body { background-color: #0f172a; color: #f8fafc; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        .card { background-color: #1e293b; border: 1px solid #334155; border-radius: 12px; }
+        .form-control, .form-select { background-color: #0f172a; border-color: #475569; color: #f8fafc; }
         .form-control:focus { background-color: #0f172a; color: #f8fafc; border-color: #3b82f6; box-shadow: none; }
-        .badge-alert { background-color: #ef4444; color: white; }
-        .badge-support { background-color: #10b981; color: white; }
-        .badge-resistance { background-color: #f59e0b; color: white; }
+        .btn-primary { background-color: #3b82f6; border: none; font-weight: 600; }
+        .btn-primary:hover { background-color: #2563eb; }
+        .table-dark { --bs-table-bg: #1e293b; }
+        .alert-box { max-height: 200px; overflow-y: auto; }
+        #tradingview_widget { height: 500px; width: 100%; border-radius: 8px; overflow: hidden; }
     </style>
 </head>
 <body class="py-4">
-    <div class="container max-w-5xl">
+    <div class="container-fluid px-4">
         <header class="d-flex justify-content-between align-items-center mb-4 pb-3 border-bottom border-secondary">
             <div>
-                <h2 class="fw-bold mb-0 text-primary">📈 Secure Pivot Point Engine</h2>
-                <small class="text-muted">OWASP Top 10 Hardened Trading Suite</small>
+                <h2 class="fw-bold mb-0 text-white">📊 Secure Pivot Calculator & Live Chart</h2>
+                <small class="text-secondary">OWASP Top 10 Hardened Trading Engine · Real-time Proximity Alerts</small>
             </div>
-            <span class="badge bg-success">Status: Live & Protected</span>
+            <div class="d-flex align-items-center gap-3">
+                <span class="badge bg-outline-info text-info border border-info px-3 py-2">
+                    Live Stream: <strong id="live-symbol">BTCUSDT</strong> (<span id="live-price" class="text-warning">$0.00</span>)
+                </span>
+                <span class="badge bg-success px-3 py-2">Status: Online</span>
+            </div>
         </header>
 
         <div class="row g-4">
-            <!-- Input Form -->
-            <div class="col-md-5">
-                <div class="card p-4 shadow-sm">
-                    <h5 class="fw-bold mb-3 text-light">Market Inputs</h5>
-                    
-                    <!-- Fetch Live Feed -->
-                    <div class="mb-3 p-3 rounded bg-dark border border-secondary">
-                        <label class="form-label small fw-bold text-info">Fetch Live Market Engine (Binance)</label>
-                        <div class="input-group input-group-sm">
-                            <input type="text" id="symbol_input" class="form-control" placeholder="e.g. BTC, ETH, SOL" value="BTC">
-                            <button class="btn btn-info fw-bold" onclick="fetchLiveMarketData()">Fetch Feed</button>
+            <!-- Left Panel: Input & Controls -->
+            <div class="col-lg-4">
+                <div class="card p-4 mb-4">
+                    <h5 class="fw-bold text-info mb-3">1. Market Data Inputs</h5>
+                    <form id="pivot-form">
+                        <div class="mb-3">
+                            <label class="form-label small text-secondary">Fetch Live OHLC (Binance Ticker)</label>
+                            <div class="input-group">
+                                <input type="text" id="symbol-input" class="form-control" value="BTC" placeholder="BTC, ETH, SOL...">
+                                <button type="button" id="btn-fetch" class="btn btn-outline-info">Fetch</button>
+                            </div>
                         </div>
-                    </div>
 
-                    <form id="pivotForm">
+                        <hr class="border-secondary my-3">
+
                         <div class="row g-2 mb-2">
                             <div class="col-6">
-                                <label class="form-label small">High Price</label>
-                                <input type="number" step="any" id="high" class="form-control" required value="150.0">
+                                <label class="form-label small text-secondary">High Price ($)</label>
+                                <input type="number" step="any" id="high-input" class="form-control" value="65000" required>
                             </div>
                             <div class="col-6">
-                                <label class="form-label small">Low Price</label>
-                                <input type="number" step="any" id="low" class="form-control" required value="140.0">
+                                <label class="form-label small text-secondary">Low Price ($)</label>
+                                <input type="number" step="any" id="low-input" class="form-control" value="62000" required>
                             </div>
                         </div>
+
                         <div class="row g-2 mb-2">
                             <div class="col-6">
-                                <label class="form-label small">Close Price</label>
-                                <input type="number" step="any" id="close" class="form-control" required value="145.0">
+                                <label class="form-label small text-secondary">Close Price ($)</label>
+                                <input type="number" step="any" id="close-input" class="form-control" value="64500" required>
                             </div>
                             <div class="col-6">
-                                <label class="form-label small">Open Price (DeMark)</label>
-                                <input type="number" step="any" id="open_price" class="form-control" value="142.0">
+                                <label class="form-label small text-secondary">Open Price ($)</label>
+                                <input type="number" step="any" id="open-input" class="form-control" value="62500">
                             </div>
                         </div>
-                        <div class="mb-3">
-                            <label class="form-label small">Current Live Price (for Alert Trigger)</label>
-                            <input type="number" step="any" id="current_price" class="form-control" value="150.1">
+
+                        <div class="row g-2 mb-3">
+                            <div class="col-6">
+                                <label class="form-label small text-secondary">Live Price ($)</label>
+                                <input type="number" step="any" id="current-input" class="form-control" value="64900">
+                            </div>
+                            <div class="col-6">
+                                <label class="form-label small text-secondary">Alert Buffer (%)</label>
+                                <input type="number" step="0.05" id="tolerance-input" class="form-control" value="0.2">
+                            </div>
                         </div>
-                        <div class="mb-3">
-                            <label class="form-label small">Alert Tolerance Threshold (%)</label>
-                            <input type="number" step="0.1" id="alert_tolerance_pct" class="form-control" value="0.5">
-                        </div>
-                        <button type="button" class="btn btn-primary w-100 fw-bold" onclick="calculatePivots()">Calculate & Run Alert Check</button>
+
+                        <button type="submit" class="btn btn-primary w-100">Calculate & Evaluate Alerts</button>
                     </form>
+                </div>
+
+                <!-- Alert Feed Card -->
+                <div class="card p-4">
+                    <h5 class="fw-bold text-warning mb-3">🚨 Live Proximity Alert Feed</h5>
+                    <div id="alert-container" class="alert-box">
+                        <p class="text-secondary small mb-0">No alerts triggered yet. Waiting for price to approach support or resistance...</p>
+                    </div>
                 </div>
             </div>
 
-            <!-- Results & Alerts -->
-            <div class="col-md-7">
-                <!-- Alerts Container -->
-                <div id="alertsContainer" class="mb-3"></div>
+            <!-- Right Panel: Live Chart & Pivot Results -->
+            <div class="col-lg-8">
+                <!-- TradingView Embed Chart -->
+                <div class="card p-3 mb-4">
+                    <div class="d-flex justify-content-between align-items-center mb-2">
+                        <h5 class="fw-bold text-white mb-0">2. Interactive Live Market Chart</h5>
+                        <small class="text-secondary">Powered by TradingView</small>
+                    </div>
+                    <div id="tradingview_widget"></div>
+                </div>
 
-                <!-- Pivot Results Cards -->
-                <div id="pivotResults" class="card p-4 shadow-sm">
-                    <h5 class="fw-bold mb-3">Calculated Pivot Levels</h5>
-                    <p class="text-muted small">Enter market parameters and click Calculate to display the multi-model pivot matrix.</p>
+                <!-- Pivot Calculations Table -->
+                <div class="card p-4">
+                    <h5 class="fw-bold text-success mb-3">3. Pivot Level Matrix</h5>
+                    <div class="table-responsive">
+                        <table class="table table-dark table-striped align-middle" id="pivot-table">
+                            <thead>
+                                <tr class="text-secondary">
+                                    <th>Model</th>
+                                    <th>Pivot (PP)</th>
+                                    <th>Support 1 (S1)</th>
+                                    <th>Support 2 (S2)</th>
+                                    <th>Resistance 1 (R1)</th>
+                                    <th>Resistance 2 (R2)</th>
+                                </tr>
+                            </thead>
+                            <tbody id="pivot-tbody">
+                                <tr><td colspan="6" class="text-center text-secondary">Click 'Calculate' to generate pivot levels</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
                 </div>
             </div>
         </div>
     </div>
 
+    <!-- TradingView Embed Script -->
+    <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
     <script>
-        async function fetchLiveMarketData() {
-            const sym = document.getElementById('symbol_input').value.trim();
-            if (!sym) return alert('Enter ticker symbol');
-            try {
-                const res = await fetch('/api/v1/fetch-market-data', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({symbol: sym, provider: 'binance'})
-                });
-                const data = await res.json();
-                if (data.status === 'success') {
-                    document.getElementById('high').value = data.ohlc.high;
-                    document.getElementById('low').value = data.ohlc.low;
-                    document.getElementById('close').value = data.ohlc.close;
-                    document.getElementById('open_price').value = data.ohlc.open;
-                    document.getElementById('current_price').value = data.ohlc.current;
-                    calculatePivots();
-                } else {
-                    alert('Error: ' + data.message);
-                }
-            } catch (err) {
-                alert('Connection error');
-            }
+        let tvWidget;
+
+        function loadTradingViewChart(symbolName) {
+            tvWidget = new TradingView.widget({
+                "autosize": true,
+                "symbol": "BINANCE:" + symbolName + "USDT",
+                "interval": "15",
+                "timezone": "Etc/UTC",
+                "theme": "dark",
+                "style": "1",
+                "locale": "en",
+                "toolbar_bg": "#0f172a",
+                "enable_publishing": false,
+                "hide_side_toolbar": false,
+                "allow_symbol_change": true,
+                "container_id": "tradingview_widget"
+            });
         }
 
-        async function calculatePivots() {
-            const req = {
-                high: parseFloat(document.getElementById('high').value),
-                low: parseFloat(document.getElementById('low').value),
-                close: parseFloat(document.getElementById('close').value),
-                open_price: parseFloat(document.getElementById('open_price').value) || null,
-                current_price: parseFloat(document.getElementById('current_price').value) || null,
-                alert_tolerance_pct: parseFloat(document.getElementById('alert_tolerance_pct').value) || 0.5
+        loadTradingViewChart("BTC");
+
+        // Live WebSocket Feed Connection (Binance Stream)
+        let ws;
+        function connectWebSocket(symbol) {
+            if (ws) ws.close();
+            const wsSymbol = symbol.toLowerCase() + "usdt";
+            ws = new WebSocket(`wss://stream.binance.com:9443/ws/${wsSymbol}@ticker`);
+
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                const livePrice = parseFloat(data.c);
+                document.getElementById("live-symbol").innerText = symbol.toUpperCase() + "USDT";
+                document.getElementById("live-price").innerText = "$" + livePrice.toFixed(2);
+                document.getElementById("current-input").value = livePrice.toFixed(2);
+            };
+        }
+
+        connectWebSocket("BTC");
+
+        // Form Submission Logic
+        document.getElementById("pivot-form").addEventListener("submit", async (e) => {
+            e.preventDefault();
+            const payload = {
+                high: parseFloat(document.getElementById("high-input").value),
+                low: parseFloat(document.getElementById("low-input").value),
+                close: parseFloat(document.getElementById("close-input").value),
+                open_price: parseFloat(document.getElementById("open-input").value) || null,
+                current_price: parseFloat(document.getElementById("current-input").value) || null,
+                alert_tolerance_pct: parseFloat(document.getElementById("tolerance-input").value) || 0.2
             };
 
-            try {
-                const res = await fetch('/api/v1/calculate', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(req)
-                });
-                const resp = await res.json();
-                if (resp.status !== 'success') {
-                    alert('Validation error: ' + resp.message);
-                    return;
-                }
+            const response = await fetch("/api/v1/calculate", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(payload)
+            });
 
-                // Render Alerts
-                const alertDiv = document.getElementById('alertsContainer');
-                alertDiv.innerHTML = '';
-                if (resp.data.alerts && resp.data.alerts.length > 0) {
-                    resp.data.alerts.forEach(a => {
-                        const alertBox = document.createElement('div');
-                        alertBox.className = 'alert alert-danger shadow-sm border-0 d-flex justify-content-between align-items-center mb-2';
-                        alertBox.innerHTML = `<div><strong>${a.message}</strong></div><span class="badge badge-alert">ALERT TRIGGERED</span>`;
-                        alertDiv.appendChild(alertBox);
-                    });
-                } else {
-                    alertDiv.innerHTML = '<div class="alert alert-success border-0 small mb-2">✅ No price level alerts triggered within current tolerance zone.</div>';
-                }
+            const resData = await response.json();
+            if (resData.status === "success") {
+                renderPivotTable(resData.data.pivots);
+                renderAlerts(resData.data.alerts);
+            }
+        });
 
-                // Render Tables
-                const pivots = resp.data.pivots;
-                let html = '<div class="table-responsive"><table class="table table-dark table-striped small align-middle"><thead><tr><th>Model</th><th>PP</th><th>R1</th><th>S1</th><th>R2</th><th>S2</th></tr></thead><tbody>';
-                
-                for (const [model, levels] of Object.entries(pivots)) {
-                    html += `<tr><td class="fw-bold text-info">${model}</td><td>${levels.PP || '-'}</td><td>${levels.R1 || '-'}</td><td>${levels.S1 || '-'}</td><td>${levels.R2 || '-'}</td><td>${levels.S2 || '-'}</td></tr>`;
-                }
-                html += '</tbody></table></div>';
-                document.getElementById('pivotResults').innerHTML = '<h5 class="fw-bold mb-3">Calculated Pivot Matrix</h5>' + html;
+        // Fetch Live OHLC Button
+        document.getElementById("btn-fetch").addEventListener("click", async () => {
+            const symbol = document.getElementById("symbol-input").value.trim().toUpperCase();
+            if (!symbol) return;
 
-            } catch (err) {
-                alert('Calculation failed');
+            const response = await fetch("/api/v1/fetch-market-data", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ symbol: symbol, provider: "binance" })
+            });
+
+            const resData = await response.json();
+            if (resData.status === "success") {
+                document.getElementById("high-input").value = resData.ohlc.high;
+                document.getElementById("low-input").value = resData.ohlc.low;
+                document.getElementById("close-input").value = resData.ohlc.close;
+                document.getElementById("open-input").value = resData.ohlc.open;
+                document.getElementById("current-input").value = resData.ohlc.current;
+
+                loadTradingViewChart(symbol);
+                connectWebSocket(symbol);
+            }
+        });
+
+        function renderPivotTable(pivots) {
+            const tbody = document.getElementById("pivot-tbody");
+            tbody.innerHTML = "";
+            for (const [model, levels] of Object.entries(pivots)) {
+                if (Object.keys(levels).length === 0) continue;
+                const tr = document.createElement("tr");
+                tr.innerHTML = `
+                    <td class="fw-bold text-info">${model}</td>
+                    <td class="text-warning">${levels.PP !== undefined ? levels.PP : '-'}</td>
+                    <td class="text-danger">${levels.S1 !== undefined ? levels.S1 : '-'}</td>
+                    <td class="text-danger">${levels.S2 !== undefined ? levels.S2 : '-'}</td>
+                    <td class="text-success">${levels.R1 !== undefined ? levels.R1 : '-'}</td>
+                    <td class="text-success">${levels.R2 !== undefined ? levels.R2 : '-'}</td>
+                `;
+                tbody.appendChild(tr);
             }
         }
-        
-        window.onload = calculatePivots;
+
+        function renderAlerts(alerts) {
+            const alertBox = document.getElementById("alert-container");
+            if (alerts.length === 0) {
+                alertBox.innerHTML = '<p class="text-secondary small mb-0">No alerts triggered. Current price is clear of nearby pivot levels.</p>';
+                return;
+            }
+
+            alertBox.innerHTML = "";
+            alerts.forEach(alert => {
+                const div = document.createElement("div");
+                div.className = "alert alert-warning py-2 px-3 mb-2 small";
+                div.innerText = alert.message;
+                alertBox.appendChild(div);
+            });
+        }
     </script>
 </body>
 </html>
 """
 
-# Web Routes
 @app.route("/", methods=["GET"])
 def index():
-    """Serves the interactive web interface."""
-    return render_template_string(HTML_TEMPLATE)
+    return render_template_string(INDEX_HTML)
 
 @app.route("/health", methods=["GET"])
-def health_check():
-    """Service health monitoring endpoint."""
-    return jsonify({"service": "SecurePivotApp", "status": "healthy", "version": "1.0.0"}), 200
+def healthcheck():
+    return jsonify({"status": "healthy", "service": "SecurePivotApp", "version": "1.0.0"}), 200
 
-# API Endpoints
 @app.route("/api/v1/calculate", methods=["POST"])
 def api_calculate_pivots():
     """Secure endpoint to calculate pivots and trigger price level proximity alerts."""
@@ -398,7 +472,7 @@ def api_fetch_market_data():
     symbol = validated.symbol.upper()
     if not TICKER_REGEX.match(symbol):
         logger.warning(f"Invalid ticker pattern attempt: {symbol}")
-        return jsonify({"status": "error", "message": "Invalid ticker symbol format"}), 400
+        return jsonify({"status": "error", "message": "Invalid ticker symbol format"}) , 400
 
     if validated.provider not in ALLOWED_DATA_PROVIDERS:
         return jsonify({"status": "error", "message": "Provider not supported"}), 400
