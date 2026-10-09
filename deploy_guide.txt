@@ -1,0 +1,14 @@
+UMARMATHI Executive Market Intelligence & Pivot Suite
+Deployment & Security Manual (Render + GitHub + Google OAuth)
+
+Title: Umarmathi pivot point calculator and automated alert if price cross pivot point, resistance, support
+
+Architecture & Security Compliance:
+1. CIA Triad & AAA Framework Alignment
+2. PII / SPII Redaction Safeguards
+3. OWASP Top 10 Controls
+
+Cloud Deployment Steps:
+1. Push to GitHub
+2. Deploy on Render (Start Command: gunicorn wsgi:app --bind 0.0.0.0:$PORT)
+3. Set UptimeRobot monitoring on /health

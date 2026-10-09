@@ -1,3 +1,5 @@
+import sqlite3
+from werkzeug.security import generate_password_hash, check_password_hash
 """
 Secure Pivot Point Calculator & Alert System (OWASP Top 10 Compliant)
 ===================================================================
@@ -23,7 +25,7 @@ import logging
 from typing import Dict, Any, Optional
 from urllib.parse import urlparse
 import requests
-from flask import Flask, request, jsonify, session, render_template_string
+from flask import Flask, request, jsonify, render_template_string, session
 from pydantic import BaseModel, Field, ValidationError
 
 # Configure Security Audit Logging
@@ -244,43 +246,107 @@ def api_fetch_market_data():
 
     return jsonify({"status": "error", "message": "Data unavailable"}), 404
 
+if __name__ == "__main__":
+    print("Starting OWASP Top 10 Secured Pivot Point Web Application Server...")
+    app.run(host="127.0.0.1", port=5000, debug=False)
 
 
 @app.route("/health", methods=["GET"])
 def health_check():
-    return jsonify({"status": "healthy", "service": "UMARMATHI Executive Pivot Suite"}), 200
+    return jsonify({"status": "healthy", "service": "Umarmathi Executive Pivot Suite"}), 200
 
 @app.route("/api/v1/test-phone-alert", methods=["POST"])
 def api_test_phone_alert():
-    data = request.get_json(force=True) or {}
-    url = data.get("url")
-    if not url:
-        return jsonify({"status": "error", "message": "No webhook or Telegram API URL provided"}), 400
     try:
-        payload = {
-            "text": "🚨 TEST ALERT: UMARMATHI Executive Mobile Push Alert Connected Successfully!",
-            "parse_mode": "HTML"
-        }
-        requests.post(url, json=payload, timeout=3)
-        return jsonify({"status": "success", "message": "Test alert dispatched to phone endpoint."}), 200
+        data = request.get_json(force=True)
+        url = data.get("webhook_url")
+        if not url:
+            return jsonify({"status": "error", "message": "Webhook URL required"}), 400
+        resp = requests.post(url, json={"text": "Connection verified!"}, timeout=5)
+        return jsonify({"status": "success", "message": f"Test dispatched (HTTP {resp.status_code})"}), 200
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
-INDEX_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>UMARMATHI Executive Market Intelligence & Pivot Suite</title>
-</head>
-<body>
-    <h1>UMARMATHI EXECUTIVE SUITE</h1>
-</body>
-</html>
-"""
 
-@app.route('/', methods=['GET'])
+DB_PATH = os.path.join(os.path.dirname(__file__), "users.db")
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            password_hash TEXT,
+            auth_provider TEXT DEFAULT 'local',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+@app.route("/api/v1/auth/register", methods=["POST"])
+def api_register():
+    data = request.get_json(force=True) or {}
+    email = data.get('email')
+    name = data.get('name')
+    password = data.get('password')
+    if not email or not name or not password:
+        return jsonify({"status": "error", "message": "Missing fields"}), 400
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM users WHERE email = ?", (email,))
+    if cursor.fetchone():
+        conn.close()
+        return jsonify({"status": "error", "message": "Email registered"}), 409
+
+    pwd_hash = generate_password_hash(password)
+    cursor.execute("INSERT INTO users (email, name, password_hash) VALUES (?, ?, ?)", (email, name, pwd_hash))
+    conn.commit()
+    conn.close()
+
+    session['user'] = {"email": email, "name": name}
+    return jsonify({"status": "success", "message": "Registration successful", "user": session['user']}), 201
+
+@app.route("/api/v1/auth/login", methods=["POST"])
+def api_login():
+    data = request.get_json(force=True) or {}
+    email = data.get('email')
+    password = data.get('password')
+    if not email or not password:
+        return jsonify({"status": "error", "message": "Missing fields"}), 400
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT email, name, password_hash FROM users WHERE email = ?", (email,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row or not check_password_hash(row[2], password):
+        return jsonify({"status": "error", "message": "Invalid credentials"}), 401
+
+    session['user'] = {"email": row[0], "name": row[1]}
+    return jsonify({"status": "success", "message": "Login successful", "user": session['user']}), 200
+
+@app.route("/api/v1/auth/me", methods=["GET"])
+def api_me():
+    user = session.get('user')
+    if user:
+        return jsonify({"authenticated": True, "user": user}), 200
+    return jsonify({"authenticated": False}), 200
+
+
+import base64
+
+INDEX_HTML = base64.b64decode('PCFET0NUWVBFIGh0bWw+PGh0bWwgbGFuZz0iZW4iPjxoZWFkPjxtZXRhIGNoYXJzZXQ9IlVURi04Ij48dGl0bGU+VW1hcm1hdGhpIHBpdm90IHBvaW50IGNhbGN1bGF0b3I8L3RpdGxlPjxtZXRhIG5hbWU9InZpZXdwb3J0IiBjb250ZW50PSJ3aWR0aD1kZXZpY2Utd2lkdGgsIGluaXRpYWwtc2NhbGU9MS4wIj48L2hlYWQ+PGJvZHk+PGgxPlVNQVJNQVRISSAyMDI2IEVYUkNVVElWRSBTVUlURTwvaDE+PC9ib2R5PjwvaHRtbD4=').decode('utf-8')
+
+@app.route("/", methods=["GET"])
 def index_page():
     return render_template_string(INDEX_HTML)
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=False)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=False)

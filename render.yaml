@@ -1,12 +1,11 @@
 services:
   - type: web
-    name: secure-pivot-app
+    name: umarmathi-pivot-suite
     env: python
-    region: oregon
-    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: gunicorn wsgi:app --bind 0.0.0.0:$PORT
-    healthCheckPath: /health
     envVars:
       - key: FLASK_SECRET_KEY
         generateValue: true
+      - key: GOOGLE_CLIENT_ID
+        sync: false
